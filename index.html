@@ -1,0 +1,360 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <title>Minecraft Server Cluster Console</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@tabler/icons-webfont@latest/tabler-icons.min.css">
+  <link rel="stylesheet" href="style.css">
+</head>
+
+<body>
+
+  <!-- Toast notification container -->
+  <div id="toast-container" aria-live="polite"></div>
+
+  <div class="mc-wrap">
+    <div class="mc-topbar">
+      <div class="grass-icon"></div>
+      <span class="mc-title">CLUSTER MANAGER</span>
+      <span style="color:#aaa;margin-left:8px;">Target: <strong id="active-target"
+          style="color:#fff;">None</strong></span>
+      <span class="pill pill-off" id="status-pill">NO SERVER SELECTED</span>
+    </div>
+
+    <div class="mc-body">
+      <!-- ===== SIDEBAR ===== -->
+      <div class="mc-sidebar">
+        <div class="sb-sec">Global</div>
+        <div class="sb-item active" data-panel="instances" onclick="sw('instances',this)"><i class="ti ti-server"></i>
+          Instances</div>
+
+        <div class="sb-sec">Active Instance</div>
+        <div class="sb-item" data-panel="overview" onclick="sw('overview',this)"><i class="ti ti-layout-dashboard"></i>
+          Overview</div>
+        <div class="sb-item" data-panel="console" onclick="sw('console',this)"><i class="ti ti-terminal-2"></i> Console
+        </div>
+        <div class="sb-item" data-panel="players" onclick="sw('players',this)"><i class="ti ti-users"></i> Players</div>
+
+        <div class="sb-sec">Config</div>
+        <div class="sb-item" data-panel="properties" onclick="sw('properties',this)"><i class="ti ti-file-text"></i>
+          Properties</div>
+        <div class="sb-item" data-panel="world" onclick="sw('world',this)"><i class="ti ti-world"></i> World</div>
+
+        <div class="sb-sec">Files</div>
+        <div class="sb-item" data-panel="upload" onclick="sw('upload',this)"><i class="ti ti-upload"></i> Upload Config
+        </div>
+        <div class="sb-item" data-panel="mods" onclick="sw('mods',this)"><i class="ti ti-package"></i> Mods</div>
+
+        <div class="sb-sec">System</div>
+        <div class="sb-item" data-panel="automation" onclick="sw('automation',this)"><i class="ti ti-clock"></i>
+          Automation</div>
+      </div>
+
+      <!-- ===== MAIN CONTENT ===== -->
+      <div class="mc-main" id="mc-main">
+
+        <!-- INSTANCES -->
+        <div id="panel-instances" class="panel active">
+          <div class="inv-panel">
+            <div class="inv-title"><span>Deploy Container</span></div>
+            <input type="text" id="new-name" class="mc-input" placeholder="Container ID (e.g., fabric-smp)">
+            <div style="display:flex;gap:6px;margin-top:6px;margin-bottom:6px;">
+              <select id="new-type" class="mc-select" style="width:25%;">
+                <option value="VANILLA">Vanilla</option>
+                <option value="PAPER">Paper</option>
+                <option value="PURPUR">Purpur</option>
+                <option value="SPIGOT">Spigot</option>
+                <option value="FORGE">Forge</option>
+                <option value="NEOFORGE">NeoForge</option>
+                <option value="FABRIC">Fabric</option>
+                <option value="BUNGEECORD">BungeeCord</option>
+                <option value="VELOCITY">Velocity</option>
+                <option value="GEYSER">GeyserMC</option>
+              </select>
+              <select id="new-version" class="mc-select" style="width:25%;">
+                <option value="LATEST">Fetching versions...</option>
+              </select>
+              <input type="text" id="new-port" class="mc-input" placeholder="Port (e.g., 25565)" style="width:25%;">
+              <input type="text" id="new-memory" class="mc-input" placeholder="Memory (e.g., 2G)" style="width:25%;"
+                value="2G">
+            </div>
+            <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">
+              <input type="checkbox" id="new-snapshot"
+                style="width:18px;height:18px;accent-color:#55ff55;cursor:pointer;">
+              <label for="new-snapshot" style="color:#333;font-size:16px;cursor:pointer;">Deploy Latest Snapshot
+                (Overrides Version)</label>
+            </div>
+            <button id="btn-deploy" class="mc-btn green" onclick="createServer()">Deploy Node</button>
+          </div>
+          <div class="inv-panel">
+            <div class="inv-title"><span>Discovered Infrastructure Nodes</span></div>
+            <div id="container-list">Scanning...</div>
+          </div>
+        </div>
+
+        <!-- OVERVIEW -->
+        <div id="panel-overview" class="panel">
+          <div class="inv-panel">
+            <div class="inv-title"><span>Telemetry Status</span></div>
+            <div class="stat-row">
+              <div class="stat-slot"><span class="stat-num" id="stat-node">N/A</span><span class="stat-lbl">Node</span>
+              </div>
+              <div class="stat-slot"><span class="stat-num" id="stat-players">0/20</span><span
+                  class="stat-lbl">Players</span></div>
+              <div class="stat-slot"><span class="stat-num" id="stat-network" style="color:#ffff55;">--</span><span
+                  class="stat-lbl">Network</span></div>
+              <div class="stat-slot"><span class="stat-num" id="stat-engine">Docker</span><span
+                  class="stat-lbl">Runtime</span></div>
+            </div>
+            <div class="health-row">
+              <div class="h-block">
+                <div class="h-lbl">HOST CPU</div>
+                <div class="h-bar-bg">
+                  <div class="h-bar bar-g" id="bar-cpu"></div>
+                </div>
+                <div id="lbl-cpu" style="font-size:12px;">--%</div>
+              </div>
+              <div class="h-block">
+                <div class="h-lbl">HOST RAM</div>
+                <div class="h-bar-bg">
+                  <div class="h-bar bar-g" id="bar-ram"></div>
+                </div>
+                <div id="lbl-ram" style="font-size:12px;">--%</div>
+              </div>
+              <div class="h-block">
+                <div class="h-lbl">HOST DISK</div>
+                <div class="h-bar-bg">
+                  <div class="h-bar bar-g" id="bar-disk"></div>
+                </div>
+                <div id="lbl-disk" style="font-size:12px;">--%</div>
+              </div>
+              <div class="h-lbl" style="margin-bottom:4px; margin-top:8px;">Container Observability</div>
+              <div class="stat-row" style="margin-bottom:10px;">
+                <div class="stat-slot"><span class="stat-num" id="stat-tps">--</span><span class="stat-lbl">Live
+                    TPS</span></div>
+                <div class="stat-slot"><span class="stat-num" style="font-size:18px;" id="c-stat-cpu">--</span><span
+                    class="stat-lbl">Dock CPU</span></div>
+                <div class="stat-slot"><span class="stat-num" style="font-size:18px;" id="c-stat-ram">--</span><span
+                    class="stat-lbl">Dock RAM</span></div>
+              </div>
+            </div>
+            <div class="h-lbl" style="margin-bottom:4px;">Server Configuration Info</div>
+            <div class="tag-row">
+              <span class="mc-tag">Mode: <span id="tag-mode">Survival</span></span>
+              <span class="mc-tag">Diff: <span id="tag-diff">Normal</span></span>
+              <span class="mc-tag">Port: <span id="tag-port">25565</span></span>
+            </div>
+          </div>
+          <div class="btn-row">
+            <button id="btn-start" class="mc-btn green" onclick="sendAction('start')">START</button>
+            <button id="btn-stop" class="mc-btn red" onclick="sendAction('stop')">STOP</button>
+            <button id="btn-restart" class="mc-btn" onclick="sendAction('restart')">RESTART</button>
+          </div>
+        </div>
+
+        <!-- CONSOLE -->
+        <div id="panel-console" class="panel">
+          <div class="inv-panel">
+            <div class="inv-title"><span>Interactive Terminal Stream</span></div>
+            <div class="console-box" id="console-log" style="color:#55ff55;"></div>
+            <div class="cin-row">
+              <span style="color:#55ff55;">&gt;</span>
+              <input type="text" class="mc-input-lg" id="console-input" placeholder="Enter command..."
+                onkeydown="if(event.key==='Enter')sendTerminalCommand()">
+              <button class="mc-btn green" onclick="sendTerminalCommand()">EXEC</button>
+            </div>
+            <div id="rcon-quick-btns" class="btn-row" style="margin-top:8px;"></div>
+          </div>
+        </div>
+
+        <!-- PLAYERS -->
+        <div id="panel-players" class="panel">
+          <div class="inv-panel">
+            <div class="inv-title">
+              <span>Online Players</span>
+              <div>
+                <button class="mc-btn" style="font-size:12px;padding:2px 8px;margin-right:4px;"
+                  onclick="requestPlayerList()">REFRESH</button>
+                <button id="btn-poll-toggle" class="mc-btn green" style="font-size:12px;padding:2px 8px;"
+                  onclick="togglePolling()">POLL: ON</button>
+              </div>
+            </div>
+            <div style="font-size:13px;color:#aaa;margin-bottom:6px;" id="p-count-lbl">Polling target daemon...</div>
+            <div class="player-list" id="player-list">
+              <div style="color:#555;font-size:14px;padding:12px 0;text-align:center;">Select an active server instance
+                to view players.</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- PROPERTIES -->
+        <div id="panel-properties" class="panel">
+          <div class="inv-panel">
+            <div class="inv-title"><span>server.properties</span></div>
+            <div class="prop-grid" id="props-grid">Select an instance to load configuration.</div>
+            <div style="margin-top:10px;display:flex;align-items:center;gap:10px;">
+              <button class="mc-btn green" onclick="saveProps()">Save Changes</button>
+              <span id="save-hint-props" style="font-size:13px;color:#aaa;"></span>
+            </div>
+          </div>
+        </div>
+
+        <!-- WORLD -->
+        <div id="panel-world" class="panel">
+          <div class="inv-panel">
+            <div class="inv-title"><span>World Generation Settings</span></div>
+            <div style="font-size:13px;color:#aaa;margin-bottom:6px;">Extracted from server.properties</div>
+            <div class="prop-grid" id="world-grid">Select an instance to load world settings.</div>
+            <div style="margin-top:10px;display:flex;align-items:center;gap:10px;">
+              <button class="mc-btn green" onclick="saveProps()">Apply Generation</button>
+              <span id="save-hint-world" style="font-size:13px;color:#aaa;"></span>
+            </div>
+          </div>
+        </div>
+
+        <!-- UPLOAD -->
+        <div id="panel-upload" class="panel">
+          <div class="inv-panel">
+            <div class="inv-title"><span>Upload Config Override</span></div>
+            <div class="upload-zone" id="upload-zone" onclick="document.getElementById('file-input').click()"
+              ondragover="event.preventDefault();this.classList.add('drag')" ondragleave="this.classList.remove('drag')"
+              ondrop="handleDrop(event)">
+              <input type="file" id="file-input" style="display:none;" accept=".properties,.txt"
+                onchange="handleFileInput(event)">
+              <i class="ti ti-upload" style="font-size:28px;display:block;margin-bottom:6px;"></i>
+              Drop server.properties here or click to browse
+            </div>
+            <div id="upload-status" style="margin-bottom:8px;font-size:14px;"></div>
+            <div
+              style="height:4px;background:#555;border-top:1px solid #373737;border-bottom:1px solid #888;margin:10px 0;">
+            </div>
+            <div style="font-size:13px;color:#aaa;margin-bottom:6px;">Or paste server.properties content:</div>
+            <textarea id="paste-area" class="mc-textarea" style="height:120px;"
+              placeholder="server-port=25565&#10;gamemode=survival&#10;..."></textarea>
+            <div class="btn-row" style="margin-top:6px;">
+              <button class="mc-btn green" onclick="loadFromPaste()">LOAD FROM TEXT</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- MODS -->
+        <div id="panel-mods" class="panel">
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
+            <div>
+              <div class="inv-panel">
+                <div class="inv-title"><span>Packwiz Dependency Engine</span></div>
+                <input type="text" id="mod-slug" class="mc-input" placeholder="Modrinth slug (e.g., sodium)">
+                <div class="btn-row" style="margin-top:6px;">
+                  <button class="mc-btn green" onclick="runPackwiz('add')">Inject Mod</button>
+                  <button class="mc-btn red" onclick="runPackwiz('remove')">Eject Mod</button>
+                </div>
+              </div>
+              <div class="inv-panel">
+                <div class="inv-title"><span>Upload Datapack (.zip)</span></div>
+                <div class="upload-zone" id="dp-upload-zone" onclick="document.getElementById('dp-file-input').click()"
+                  ondragover="event.preventDefault();this.classList.add('drag')"
+                  ondragleave="this.classList.remove('drag')" ondrop="handleDatapackDrop(event)">
+                  <input type="file" id="dp-file-input" style="display:none;" accept=".zip"
+                    onchange="handleDatapackInput(event)">
+                  <i class="ti ti-box" style="font-size:28px;display:block;margin-bottom:6px;"></i>
+                  Drop datapack zip here or click to browse
+                </div>
+                <div id="dp-upload-status" style="font-size:14px;color:#1a4a1a;"></div>
+              </div>
+            </div>
+            <div class="inv-panel" style="max-height:480px;overflow-y:auto;">
+              <div class="inv-title">
+                <span>Component Registry</span>
+                <button class="mc-btn" style="font-size:12px;padding:2px 8px;"
+                  onclick="loadInstalledAddons()">REFRESH</button>
+              </div>
+              <div style="margin-bottom:10px;">
+                <h4 class="section-heading">Datapacks</h4>
+                <div id="registry-datapacks" style="font-size:14px;padding:4px 0;color:#444;">Select a server to view
+                  data...</div>
+              </div>
+              <div style="margin-bottom:10px;">
+                <h4 class="section-heading">Mods (.jar)</h4>
+                <div id="registry-mods" style="font-size:14px;padding:4px 0;color:#444;">Select a server to view data...
+                </div>
+              </div>
+              <div>
+                <h4 class="section-heading">Plugins (.jar)</h4>
+                <div id="registry-plugins" style="font-size:14px;padding:4px 0;color:#444;">Select a server to view
+                  data...</div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- AUTOMATION -->
+        <div id="panel-automation" class="panel">
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
+            <div class="inv-panel">
+              <div class="inv-title">
+                <span>Volume Snapshots</span>
+                <button class="mc-btn" style="font-size:12px;padding:2px 8px;" onclick="loadBackups()">REFRESH</button>
+              </div>
+              <p style="font-size:14px;color:#555;margin-bottom:8px;">Capture a tar.gz archive of the active server's
+                /data volume.</p>
+              <button class="mc-btn green" style="margin-bottom:12px;width:100%;" onclick="triggerBackup()">CAPTURE
+                SNAPSHOT</button>
+              <h4 class="section-heading">Archive Registry</h4>
+              <div id="backup-list" style="font-size:14px;padding:4px 0;color:#444;max-height:200px;overflow-y:auto;">
+                Loading...</div>
+            </div>
+            <div class="inv-panel">
+              <div class="inv-title">
+                <span>Cron Task Scheduler</span>
+                <button class="mc-btn" style="font-size:12px;padding:2px 8px;" onclick="loadJobs()">REFRESH</button>
+              </div>
+              <div style="display:flex;gap:6px;margin-bottom:6px;">
+                <input type="text" id="cron-str" class="mc-input" placeholder="0 4 * * * (Daily at 4AM)"
+                  style="width:50%;">
+                <select id="cron-action" class="mc-select" style="width:50%;">
+                  <option value="backup">Snapshot Backup</option>
+                  <option value="restart">Restart Server</option>
+                  <option value="stop">Stop Server</option>
+                  <option value="start">Start Server</option>
+                </select>
+              </div>
+              <button class="mc-btn green" style="margin-bottom:12px;width:100%;" onclick="createJob()">SCHEDULE
+                TASK</button>
+              <h4 class="section-heading">Active Routines</h4>
+              <div id="job-list" style="font-size:14px;padding:4px 0;color:#444;max-height:200px;overflow-y:auto;">
+                Loading...</div>
+            </div>
+          </div>
+        </div>
+
+      </div><!-- /mc-main -->
+    </div><!-- /mc-body -->
+
+    <!-- Player NBT Modal -->
+    <div id="player-modal" class="modal-overlay">
+      <div class="modal-box">
+        <div class="modal-title">
+          <span id="modal-pname" style="color:#3f3f3f;text-shadow:1px 1px #fff;">Player NBT Data</span>
+          <button class="mc-btn red" style="padding:0 8px;font-size:20px;" onclick="closeModal()">X</button>
+        </div>
+        <div
+          style="display:flex;gap:6px;margin-bottom:10px;flex-wrap:wrap;border-bottom:2px solid #555;padding-bottom:8px;">
+          <button class="mc-btn" onclick="fetchCategory('all')">Raw NBT</button>
+          <button class="mc-btn" onclick="fetchCategory('identity')">Identity</button>
+          <button class="mc-btn" onclick="fetchCategory('location')">Location</button>
+          <button class="mc-btn" onclick="fetchCategory('inventory')">Inventory &amp; Storage</button>
+          <button class="mc-btn" onclick="fetchCategory('vitals')">Vital Stats</button>
+          <button class="mc-btn" onclick="fetchCategory('mechanics')">Mechanics</button>
+          <button class="mc-btn" onclick="fetchCategory('metadata')">Metadata</button>
+        </div>
+        <div id="modal-pdata" class="modal-content">Connecting to RCON feed...</div>
+      </div>
+    </div>
+
+  </div><!-- /mc-wrap -->
+
+  <script src="script.js"></script>
+</body>
+
+</html>
