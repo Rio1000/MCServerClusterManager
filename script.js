@@ -22,6 +22,50 @@ const WORLD_KEYS = [
 ];
 const SKIP_PROPS = new Set(WORLD_KEYS);
 
+// server.properties is a flat wall of ~60 keys; grouping it is what keeps the
+// Properties panel readable. Unlisted keys fall through to an "Other" group.
+const PROP_GROUPS = [
+  {
+    name: 'Network & Access',
+    keys: [
+      'server-ip', 'server-port', 'server-name', 'motd', 'max-players', 'online-mode',
+      'white-list', 'enforce-whitelist', 'prevent-proxy-connections', 'network-compression-threshold',
+      'rate-limit', 'enable-status', 'hide-online-players', 'enforce-secure-profile',
+      'accepts-transfers', 'log-ips', 'bug-report-link'
+    ]
+  },
+  {
+    name: 'Remote Admin',
+    keys: [
+      'enable-rcon', 'rcon.port', 'rcon.password', 'broadcast-rcon-to-ops',
+      'enable-query', 'query.port', 'broadcast-console-to-ops', 'enable-jmx-monitoring', 'debug'
+    ]
+  },
+  {
+    name: 'Gameplay',
+    keys: [
+      'gamemode', 'force-gamemode', 'difficulty', 'hardcore', 'pvp', 'allow-flight',
+      'player-idle-timeout', 'enable-command-block', 'op-permission-level',
+      'function-permission-level', 'text-filtering-config', 'text-filtering-version'
+    ]
+  },
+  {
+    name: 'Resource Packs',
+    keys: [
+      'resource-pack', 'resource-pack-sha1', 'resource-pack-prompt', 'resource-pack-id',
+      'require-resource-pack', 'initial-enabled-packs', 'initial-disabled-packs'
+    ]
+  },
+  {
+    name: 'Performance',
+    keys: [
+      'view-distance', 'simulation-distance', 'entity-broadcast-range-percentage',
+      'max-tick-time', 'max-chained-neighbor-updates', 'sync-chunk-writes',
+      'use-native-transport', 'pause-when-empty-seconds', 'region-file-compression'
+    ]
+  }
+];
+
 // Panels that auto-refresh on inactive servers – poll less aggressively
 const PASSIVE_PANELS = new Set(['properties', 'world', 'upload', 'mods', 'automation']);
 
@@ -62,6 +106,8 @@ document.addEventListener('DOMContentLoaded', () => {
   fetchNodes();
   connectWS();
   populateVersionsDynamically();
+  renderRconCommands();
+  renderModalTabs();
 });
 
 // ---------------------------------------------------------------------------
@@ -102,12 +148,12 @@ function connectWS() {
 
       const pListEl = document.getElementById('player-list');
       pListEl.innerHTML = players.length === 0
-        ? `<div style="color:#555;font-size:14px;padding:12px 0;text-align:center;">No players currently online.</div>`
+        ? `<div class="empty">No players currently online.</div>`
         : players.map(p => `
             <div class="p-row">
               <div class="p-head"></div>
               <div class="p-name">${escapeHtml(p)}</div>
-              <button class="mc-btn" style="font-size:12px;padding:2px 8px;" onclick="showPlayerData('${escapeHtml(p)}')">NBT</button>
+              <button class="mc-btn sm" onclick="showPlayerData('${escapeHtml(p)}')">NBT</button>
             </div>`).join('');
     }
 
@@ -153,10 +199,7 @@ function renderRconCommands() {
   if (!container) return;
 
   container.innerHTML = RCON_COMMANDS.map(btn =>
-    `<button class="mc-btn" style="font-size:14px;padding:2px 8px;" 
-      onclick="sendQuickCommand('${escapeHtml(btn.cmd)}')">
-      ${escapeHtml(btn.label)}
-    </button>`
+    `<button class="mc-btn sm" onclick="sendQuickCommand('${escapeHtml(btn.cmd)}')">${escapeHtml(btn.label)}</button>`
   ).join('');
 }
 
@@ -171,13 +214,6 @@ function sendQuickCommand(cmd) {
   }
 }
 
-// Update your DOMContentLoaded listener:
-document.addEventListener('DOMContentLoaded', () => {
-  fetchNodes();
-  connectWS();
-  populateVersionsDynamically();
-  renderRconCommands(); // NEW
-});
 // ---------------------------------------------------------------------------
 // Resource bar helper — green / yellow / red thresholds
 // ---------------------------------------------------------------------------
@@ -201,6 +237,11 @@ function logTerm(msg, isErr = false) {
   d.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
   el.appendChild(d);
   el.scrollTop = el.scrollHeight;
+}
+
+function clearConsole() {
+  const el = document.getElementById('console-log');
+  if (el) el.innerHTML = '';
 }
 
 function sendTerminalCommand() {
@@ -332,7 +373,7 @@ function setServerTarget(name, status) {
   } else {
     document.getElementById('p-count-lbl').textContent = 'Server container offline.';
     document.getElementById('player-list').innerHTML =
-      `<div style="color:#555;font-size:14px;padding:12px 0;text-align:center;">Instance must be running to parse player data.</div>`;
+      '<div class="empty">Instance must be running to parse player data.</div>';
     document.getElementById('stat-players').textContent = `0/${currentProps['max-players'] || '20'}`;
   }
 }
@@ -362,7 +403,7 @@ async function fetchNodes() {
   const container = document.getElementById('container-list');
 
   if (!res || !res.ok) {
-    if (!activeServer) container.innerHTML = "<div style='color:#ff5555;text-align:center;'>Cannot reach daemon API.</div>";
+    if (!activeServer) container.innerHTML = '<div class="empty err">Cannot reach daemon API.</div>';
     return;
   }
 
@@ -370,21 +411,24 @@ async function fetchNodes() {
   if (!data) return;
 
   if (!data.servers || data.servers.length === 0) {
-    container.innerHTML = "<div style='color:#555;text-align:center;'>No managed containers found.</div>";
+    container.innerHTML = '<div class="empty">No managed containers found. Deploy one below.</div>';
     return;
   }
 
-  container.innerHTML = data.servers.map(s => `
+  container.innerHTML = data.servers.map(s => {
+    const up = String(s.status).toLowerCase().includes('up');
+    return `
     <div class="srv-card">
-      <div>
-        <strong>${escapeHtml(s.name)}</strong><br>
-        <span style="font-size:13px;color:#444;">Status: ${escapeHtml(s.status)} | Bindings: ${escapeHtml(s.ports || 'None')}</span>
+      <div class="row-main">
+        <div class="srv-name"><span class="status-dot${up ? ' up' : ''}"></span>${escapeHtml(s.name)}</div>
+        <div class="srv-meta">${escapeHtml(s.status)} &middot; ${escapeHtml(s.ports || 'no bindings')}</div>
       </div>
-      <div style="display:flex;gap:6px;">
+      <div class="btn-row">
         <button class="mc-btn" onclick="setServerTarget('${escapeHtml(s.name)}','${escapeHtml(s.status)}');sw('overview',document.querySelector('[data-panel=overview]'))">SELECT</button>
         <button class="mc-btn red" onclick="deleteServer('${escapeHtml(s.name)}')">DELETE</button>
       </div>
-    </div>`).join('');
+    </div>`;
+  }).join('');
 
   if (activeServer) {
     const node = data.servers.find(s => s.name === activeServer);
@@ -500,7 +544,7 @@ function togglePolling() {
   pollingEnabled = !pollingEnabled;
   const btn = document.getElementById('btn-poll-toggle');
   btn.textContent = pollingEnabled ? 'POLL: ON' : 'POLL: OFF';
-  btn.className = pollingEnabled ? 'mc-btn green' : 'mc-btn';
+  btn.className = pollingEnabled ? 'mc-btn sm green' : 'mc-btn sm';
   if (pollingEnabled) requestPlayerList();
 }
 
@@ -514,6 +558,24 @@ function requestPlayerList() {
 // ---------------------------------------------------------------------------
 // Player NBT modal
 // ---------------------------------------------------------------------------
+const NBT_CATEGORIES = [
+  { id: 'all', label: 'Raw NBT' },
+  { id: 'identity', label: 'Identity' },
+  { id: 'location', label: 'Location' },
+  { id: 'inventory', label: 'Inventory' },
+  { id: 'vitals', label: 'Vitals' },
+  { id: 'mechanics', label: 'Mechanics' },
+  { id: 'metadata', label: 'Metadata' }
+];
+
+function renderModalTabs() {
+  const el = document.getElementById('modal-tabs');
+  if (!el) return;
+  el.innerHTML = NBT_CATEGORIES.map(c =>
+    `<button class="mc-btn sm tab" data-cat="${c.id}" onclick="fetchCategory('${c.id}')">${c.label}</button>`
+  ).join('');
+}
+
 function showPlayerData(playerName) {
   currentPlayerTarget = playerName;
   document.getElementById('player-modal').classList.add('active');
@@ -522,6 +584,8 @@ function showPlayerData(playerName) {
 }
 
 function fetchCategory(cat) {
+  document.querySelectorAll('#modal-tabs .tab').forEach(t =>
+    t.classList.toggle('active', t.dataset.cat === cat));
   document.getElementById('modal-pdata').textContent = `Pulling [${cat}] from RCON...`;
   if (ws && ws.readyState === WebSocket.OPEN && activeServer && currentPlayerTarget) {
     ws.send(JSON.stringify({
@@ -544,39 +608,79 @@ async function loadPropsFromServer() {
   const pGrid = document.getElementById('props-grid');
   const wGrid = document.getElementById('world-grid');
   if (!res || !res.ok) {
-    const msg = `<div style="color:#ff5555;padding:10px;">Could not load server.properties.</div>`;
+    const msg = '<div class="empty err">Could not load server.properties.</div>';
     pGrid.innerHTML = msg; wGrid.innerHTML = msg; return;
   }
   const data = await res.json().catch(() => ({}));
   if (data.error || data.detail) {
-    const msg = `<div style="color:#555;padding:10px;">${escapeHtml(data.error || data.detail)}</div>`;
+    const msg = `<div class="empty">${escapeHtml(data.error || data.detail)}</div>`;
     pGrid.innerHTML = msg; wGrid.innerHTML = msg; return;
   }
   currentProps = data;
   renderBothGrids();
 }
 
-function renderBothGrids() {
-  document.getElementById('props-grid').innerHTML = Object.entries(currentProps)
-    .filter(([k]) => !SKIP_PROPS.has(k))
-    .map(([k, v]) => `
-      <div class="prop-slot">
-        <div class="prop-lbl">${escapeHtml(k)}</div>
-        <input class="mc-input" id="prop-${escapeHtml(k)}" value="${escapeHtml(v)}"
-          onchange="updatePropMemory('${escapeHtml(k)}',this.value)">
-      </div>`).join('');
-
-  document.getElementById('world-grid').innerHTML = WORLD_KEYS.map(k => {
-    const v = currentProps[k] !== undefined ? currentProps[k] : '';
-    return `
-      <div class="prop-slot">
-        <div class="prop-lbl">${escapeHtml(k)}</div>
+function propSlot(k, v) {
+  return `
+      <div class="prop-slot" data-key="${escapeHtml(k)}">
+        <div class="prop-lbl" title="${escapeHtml(k)}">${escapeHtml(k)}</div>
         <input class="mc-input" id="prop-${escapeHtml(k)}" value="${escapeHtml(v)}"
           onchange="updatePropMemory('${escapeHtml(k)}',this.value)">
       </div>`;
-  }).join('');
+}
+
+function renderBothGrids() {
+  // Bucket every known key into its group; anything unrecognised lands in Other,
+  // so a new Mojang property still shows up instead of silently disappearing.
+  const buckets = PROP_GROUPS.map(g => ({ name: g.name, keys: [] }));
+  const other = { name: 'Other', keys: [] };
+
+  Object.keys(currentProps)
+    .filter(k => !SKIP_PROPS.has(k))
+    .sort()
+    .forEach(k => {
+      const idx = PROP_GROUPS.findIndex(g => g.keys.includes(k));
+      (idx >= 0 ? buckets[idx] : other).keys.push(k);
+    });
+
+  const groups = buckets.concat([other]).filter(g => g.keys.length);
+  document.getElementById('props-grid').innerHTML = groups.length === 0
+    ? '<div class="empty">No properties returned by the daemon.</div>'
+    : groups.map((g, i) => `
+      <details class="prop-group"${i === 0 ? ' open' : ''}>
+        <summary>${escapeHtml(g.name)}<span class="prop-count">${g.keys.length}</span></summary>
+        <div class="prop-grid">${g.keys.map(k => propSlot(k, currentProps[k])).join('')}</div>
+      </details>`).join('');
+
+  document.getElementById('world-grid').innerHTML = WORLD_KEYS
+    .map(k => propSlot(k, currentProps[k] !== undefined ? currentProps[k] : ''))
+    .join('');
+
+  // Re-apply any active filter so the view does not jump back to "everything".
+  const filterEl = document.getElementById('props-filter');
+  if (filterEl && filterEl.value) filterProps(filterEl.value);
 
   updateOverviewTags();
+}
+
+function filterProps(term) {
+  const q = term.trim().toLowerCase();
+  document.querySelectorAll('#props-grid .prop-group').forEach(group => {
+    let shown = 0;
+    group.querySelectorAll('.prop-slot').forEach(slot => {
+      const hit = !q || slot.dataset.key.toLowerCase().includes(q);
+      slot.hidden = !hit;
+      if (hit) shown++;
+    });
+    group.hidden = shown === 0;
+    const count = group.querySelector('.prop-count');
+    if (count) count.textContent = shown;
+    if (q) group.open = true;
+  });
+}
+
+function expandAllProps(open) {
+  document.querySelectorAll('#props-grid .prop-group').forEach(g => { g.open = open; });
 }
 
 function updatePropMemory(key, val) {
@@ -584,7 +688,7 @@ function updatePropMemory(key, val) {
   updateOverviewTags();
   ['save-hint-props', 'save-hint-world'].forEach(id => {
     const el = document.getElementById(id);
-    el.textContent = '* Unsaved changes'; el.style.color = '#ffff55';
+    el.textContent = '* Unsaved changes'; el.style.color = '#8a6d00';
   });
 }
 
@@ -611,7 +715,7 @@ async function saveProps() {
 
   ['save-hint-props', 'save-hint-world'].forEach(id => {
     const el = document.getElementById(id);
-    el.textContent = '[SAVED]'; el.style.color = '#55ff55';
+    el.textContent = '[SAVED]'; el.style.color = '#1a5c1a';
     setTimeout(() => { el.textContent = ''; }, 3000);
   });
 }
@@ -641,7 +745,7 @@ function handleFileInput(e) { const f = e.target.files[0]; if (f) processFileBlo
 
 function processFileBlock(file) {
   if (!activeServer) {
-    document.getElementById('upload-status').innerHTML = '<span style="color:#ff5555">Select an active server first.</span>';
+    document.getElementById('upload-status').innerHTML = '<span class="err">Select an active server first.</span>';
     return;
   }
   const reader = new FileReader();
@@ -649,11 +753,11 @@ function processFileBlock(file) {
     const dict = parsePropsText(e.target.result);
     const statusBox = document.getElementById('upload-status');
     if (!Object.keys(dict).length) {
-      statusBox.innerHTML = '<span style="color:#ff5555">No valid property keys found.</span>'; return;
+      statusBox.innerHTML = '<span class="err">No valid property keys found.</span>'; return;
     }
     currentProps = { ...currentProps, ...dict };
     renderBothGrids(); saveProps();
-    statusBox.innerHTML = `<span style="color:#55ff55">[OK] Injected ${Object.keys(dict).length} parameters.</span>`;
+    statusBox.innerHTML = `<span class="ok">[OK] Injected ${Object.keys(dict).length} parameters.</span>`;
   };
   reader.readAsText(file);
 }
@@ -674,14 +778,14 @@ function loadFromPaste() {
 // ---------------------------------------------------------------------------
 async function loadInstalledAddons() {
   if (!activeServer) return;
-  const loading = '<div style="color:#aaa;font-style:italic;padding-left:4px;">Scanning volume...</div>';
+  const loading = '<div class="empty">Scanning volume…</div>';
   ['registry-datapacks', 'registry-mods', 'registry-plugins'].forEach(id => {
     document.getElementById(id).innerHTML = loading;
   });
 
   const res = await fetch(`/api/server/${activeServer}/addons`).catch(() => null);
   if (!res || !res.ok) {
-    const err = '<div style="color:#ff5555;font-style:italic;padding-left:4px;">API error – check backend.</div>';
+    const err = '<div class="empty err">API error – check backend.</div>';
     ['registry-datapacks', 'registry-mods', 'registry-plugins'].forEach(id => {
       document.getElementById(id).innerHTML = err;
     });
@@ -689,8 +793,9 @@ async function loadInstalledAddons() {
   }
   const data = await res.json().catch(() => ({}));
   const renderList = items => {
-    if (!items || !items.length) return '<div style="color:#666;font-style:italic;padding-left:4px;">None detected</div>';
-    return items.map(item => `<div style="padding:2px 4px;font-family:monospace;border-bottom:1px dashed #aaa;color:#111;">📦 ${escapeHtml(item)}</div>`).join('');
+    if (!items || !items.length) return '<div class="empty">None detected</div>';
+    return items.map(item =>
+      `<div class="list-row"><div class="row-main mono">${escapeHtml(item)}</div></div>`).join('');
   };
   document.getElementById('registry-datapacks').innerHTML = renderList(data.datapacks);
   document.getElementById('registry-mods').innerHTML = renderList(data.mods);
@@ -707,7 +812,7 @@ function handleDatapackInput(e) { const f = e.target.files[0]; if (f) uploadData
 
 async function uploadDatapackFile(file) {
   if (!activeServer) {
-    document.getElementById('dp-upload-status').innerHTML = '<span style="color:#ff5555">Select a target container first.</span>';
+    document.getElementById('dp-upload-status').innerHTML = '<span class="err">Select a target container first.</span>';
     return;
   }
   const statusBox = document.getElementById('dp-upload-status');
@@ -719,11 +824,11 @@ async function uploadDatapackFile(file) {
   }).catch(() => null);
   if (!res || !res.ok) {
     const data = res ? await res.json().catch(() => ({})) : {};
-    statusBox.innerHTML = `<span style="color:#ff5555">${escapeHtml(data.detail || 'Upload failed.')}</span>`;
+    statusBox.innerHTML = `<span class="err">${escapeHtml(data.detail || 'Upload failed.')}</span>`;
     return;
   }
   const data = await res.json().catch(() => ({}));
-  statusBox.innerHTML = `<span style="color:#1a4a1a">${escapeHtml(data.message || 'Uploaded.')}</span>`;
+  statusBox.innerHTML = `<span class="ok">${escapeHtml(data.message || 'Uploaded.')}</span>`;
   toast(data.message || 'Datapack uploaded.', 'ok');
   loadInstalledAddons();
 }
@@ -754,21 +859,21 @@ async function runPackwiz(action) {
 // Replace your existing loadBackups() with this:
 async function loadBackups() {
   const container = document.getElementById('backup-list');
-  container.innerHTML = "<div style='color:#777;'>Fetching archives...</div>";
+  container.innerHTML = '<div class="empty">Fetching archives…</div>';
   const res = await fetch('/api/backups').catch(() => null);
 
   if (!res || !res.ok) {
-    container.innerHTML = "<div style='color:#ff5555'>Failed to fetch backups.</div>";
+    container.innerHTML = '<div class="empty err">Failed to fetch backups.</div>';
     return;
   }
 
   const data = await res.json().catch(() => ({}));
   container.innerHTML = (!data.backups || !data.backups.length)
-    ? "<div style='color:#555;'>No archives found in _backups directory.</div>"
+    ? '<div class="empty">No archives found in the _backups directory.</div>'
     : data.backups.map(b => `
-        <div style="padding:6px 0;border-bottom:1px dashed #aaa;display:flex;justify-content:space-between;align-items:center;">
-          <div style="color:#111;font-family:monospace;">📦 ${escapeHtml(b)}</div>
-          <button class="mc-btn orange" style="padding:2px 6px;font-size:12px;" onclick="executeRestore('${escapeHtml(b)}')">RESTORE</button>
+        <div class="list-row">
+          <div class="row-main mono">${escapeHtml(b)}</div>
+          <button class="mc-btn orange sm" onclick="executeRestore('${escapeHtml(b)}')">RESTORE</button>
         </div>`).join('');
 }
 
@@ -823,21 +928,21 @@ async function triggerBackup() {
 // ---------------------------------------------------------------------------
 async function loadJobs() {
   const container = document.getElementById('job-list');
-  container.innerHTML = "<div style='color:#777;'>Fetching scheduled routines...</div>";
+  container.innerHTML = '<div class="empty">Fetching scheduled routines…</div>';
   const res = await fetch('/api/jobs').catch(() => null);
   if (!res || !res.ok) {
-    container.innerHTML = "<div style='color:#ff5555'>Failed to fetch jobs.</div>"; return;
+    container.innerHTML = '<div class="empty err">Failed to fetch jobs.</div>'; return;
   }
   const data = await res.json().catch(() => ({}));
   container.innerHTML = (!data.jobs || !data.jobs.length)
-    ? "<div style='color:#555;'>No active routines scheduled.</div>"
+    ? '<div class="empty">No active routines scheduled.</div>'
     : data.jobs.map(j => `
-        <div style="padding:6px 0;border-bottom:1px dashed #aaa;display:flex;justify-content:space-between;align-items:center;">
-          <div>
-            <strong style="color:#1a4a1a;">[${escapeHtml(j.target)}]</strong> ${escapeHtml(j.action.toUpperCase())}<br>
-            <span style="font-size:12px;color:#555;">Cron: ${escapeHtml(j.cron)}</span>
+        <div class="list-row">
+          <div class="row-main">
+            <div>${escapeHtml(j.action.toUpperCase())} &rarr; ${escapeHtml(j.target)}</div>
+            <div class="row-sub mono">${escapeHtml(j.cron)}</div>
           </div>
-          <button class="mc-btn red" style="padding:2px 6px;font-size:12px;" onclick="deleteJob('${escapeHtml(j.id)}')">DEL</button>
+          <button class="mc-btn red sm" onclick="deleteJob('${escapeHtml(j.id)}')">DEL</button>
         </div>`).join('');
 }
 
