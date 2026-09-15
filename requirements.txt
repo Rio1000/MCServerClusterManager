@@ -1,0 +1,16 @@
+# Runtime dependencies for web_manager.py.
+# Versions pinned to what the previously committed mc_venv/ contained.
+#
+#   python3 -m venv mc_venv
+#   ./mc_venv/bin/pip install -r requirements.txt
+#
+fastapi==0.138.1
+uvicorn==0.49.0
+psutil==7.2.2
+apscheduler==3.11.2
+
+# Not imported directly, but required at runtime:
+#   websockets      — uvicorn's WebSocket protocol implementation (/ws endpoint)
+#   python-multipart — FastAPI UploadFile/File parsing (datapack upload endpoint)
+websockets==16.0
+python-multipart==0.0.32
