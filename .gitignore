@@ -1,0 +1,14 @@
+# Python virtualenv — recreate locally from requirements.txt, never commit
+mc_venv/
+venv/
+.venv/
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Editor / OS noise
+.vscode/
+.idea/
+*.swp
+.DS_Store
