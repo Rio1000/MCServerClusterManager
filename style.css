@@ -17,24 +17,90 @@
 }
 
 :root {
-  /* Palette */
-  --dirt: #866043;
-  --inv-bg: #c6c6c6;
-  --inv-dark: #555;
-  --inv-light: #fff;
-  --inv-mid: #8b8b8b;
+  /* ── Minecraft accent colours — identical in both themes ─────────────── */
   --mc-green: #55ff55;
   --mc-yellow: #ffff55;
   --mc-red: #ff5555;
   --mc-cyan: #55ffff;
   --mc-white: #f0f0f0;
   --mc-gray: #aaaaaa;
+
+  /* ── Theme surface tokens (day) ───────────────────────────────────────
+     Every theme-dependent colour in this file resolves through one of
+     these. The night overrides below restate the same names and nothing
+     else, so a new rule only needs to pick the right token. */
+
+  /* Chrome — the frame around the panels */
+  --app-bg-outer: #141414;
+  --app-bg: #1d1d1d;
+  --topbar-bg: #2d2d2d;
+  --ctxbar-bg: #232323;
+  --sidebar-bg: #3b3b3b url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16'%3E%3Crect width='16' height='16' fill='%23555'/%3E%3Crect x='0' y='0' width='8' height='8' fill='%23595959'/%3E%3C/svg%3E");
+  --wrap-bg: #1a1a1a url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='32' height='32'%3E%3Crect width='32' height='32' fill='%23866043'/%3E%3Crect x='0' y='0' width='16' height='16' fill='%23916845'/%3E%3Crect x='16' y='16' width='16' height='16' fill='%23916845'/%3E%3C/svg%3E");
+  --chrome-ink: #cccccc;
+  --chrome-ink-faint: #8d8d8d;
+
+  /* Inventory panel */
+  --panel-bg: #c6c6c6;
+  --panel-edge-lt: #ffffff;
+  --panel-edge-dk: #555555;
+  --panel-rule: #555555;
+
+  /* Inset tiles (stat slots, meters, property fields, drop zones) */
+  --slot-bg: #8b8b8b;
+  --slot-edge-lt: #ffffff;
+  --slot-edge-dk: #373737;
+
+  /* Raised rows (server cards, player rows) */
+  --row-bg: #8b8b8b;
+  --row-edge-lt: #ffffff;
+  --row-edge-dk: #373737;
+
+  /* Property groups */
+  --group-bg: #bdbdbd;
+  --group-edge-lt: #d8d8d8;
+  --group-edge-dk: #9a9a9a;
+  --group-hover: #cacaca;
+
+  /* Text on panels */
+  --ink: #1a1a1a;
+  --ink-title: #3f3f3f;
+  --ink-heading: #373737;
+  --ink-soft: #242424;
+  --ink-meta: #242424;
+  --ink-faint: #4c4c4c;
+  --emboss: #ffffff;
+  --emboss-soft: #dddddd;
+
+  /* Dividers and disclosure markers */
+  --divider: #8b8b8b;
+  --divider-dash: #9a9a9a;
+  --marker: #4f4f4f;
+  --rule-bg: #8b8b8b;
+  --rule-lt: #e6e6e6;
+  --rule-dk: #6d6d6d;
+  --meter-track: #373737;
+
+  /* Buttons */
   --btn-face: #9d9d9d;
   --btn-light: #f0f0f0;
   --btn-dark: #373737;
-  --ink: #1a1a1a;
-  --ink-soft: #444;
-  --ink-faint: #6a6a6a;
+  --btn-hover: #b0b0b0;
+  --btn-ink: #1a1a1a;
+  --btn-emboss: #dddddd;
+
+  --upload-hover: #a5a5a5;
+
+  /* Status text */
+  --ok-ink: #1a5c1a;
+  --err-ink: #8b1a1a;
+  --warn-ink: #644f00;
+
+  /* Scrollbars */
+  --scroll-track: #2a2a2a;
+  --scroll-thumb: #6d6d6d;
+  --scroll-thumb-lt: #b0b0b0;
+  --scroll-thumb-dk: #373737;
 
   /* Spacing scale — every gap/pad in the app comes from here */
   --s1: 4px;
@@ -52,10 +118,193 @@
   --t-2xl: 30px;
 }
 
+/* ── Night theme ──────────────────────────────────────────────────────────
+   Applied when the OS asks for dark and the user has not overridden it, or
+   when they pick it explicitly. Both blocks carry the same declarations;
+   plain CSS has no way to share them. */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+  /* Chrome — deepened so the panels still read as raised above it */
+  --app-bg-outer: #0b0b0b;
+  --app-bg: #141414;
+  --topbar-bg: #1f1f1f;
+  --ctxbar-bg: #181818;
+  --sidebar-bg: #242424 url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16'%3E%3Crect width='16' height='16' fill='%232c2c2c'/%3E%3Crect x='0' y='0' width='8' height='8' fill='%23313131'/%3E%3C/svg%3E");
+  --wrap-bg: #0d0d0d url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='32' height='32'%3E%3Crect width='32' height='32' fill='%234a3526'/%3E%3Crect x='0' y='0' width='16' height='16' fill='%23523c2c'/%3E%3Crect x='16' y='16' width='16' height='16' fill='%23523c2c'/%3E%3C/svg%3E");
+  --chrome-ink: #cfcfcf;
+  --chrome-ink-faint: #8a8a8a;
+
+  /* Inventory panel — deepslate instead of light stone */
+  --panel-bg: #3a3a3a;
+  --panel-edge-lt: #565656;
+  --panel-edge-dk: #1b1b1b;
+  --panel-rule: #616161;
+
+  /* Inset tiles (stat slots, meters, property fields, drop zones) */
+  --slot-bg: #2a2a2a;
+  --slot-edge-lt: #4e4e4e;
+  --slot-edge-dk: #141414;
+
+  /* Raised rows (server cards, player rows) */
+  --row-bg: #333333;
+  --row-edge-lt: #4e4e4e;
+  --row-edge-dk: #161616;
+
+  /* Property groups */
+  --group-bg: #333333;
+  --group-edge-lt: #4a4a4a;
+  --group-edge-dk: #1e1e1e;
+  --group-hover: #3f3f3f;
+
+  /* Text on panels. The bevel emboss flips from a white highlight to a
+     black drop shadow, which is what keeps the pixel lettering readable. */
+  --ink: #e6e6e6;
+  --ink-title: #dcdcdc;
+  --ink-heading: #cfcfcf;
+  --ink-soft: #c4c4c4;
+  --ink-meta: #b4b4b4;
+  --ink-faint: #a3a3a3;
+  --emboss: #000000;
+  --emboss-soft: #121212;
+
+  /* Dividers and disclosure markers */
+  --divider: #565656;
+  --divider-dash: #4e4e4e;
+  --marker: #b0b0b0;
+  --rule-bg: #2a2a2a;
+  --rule-lt: #4a4a4a;
+  --rule-dk: #141414;
+  --meter-track: #171717;
+
+  /* Buttons */
+  --btn-face: #4d4d4d;
+  --btn-light: #6e6e6e;
+  --btn-dark: #1c1c1c;
+  --btn-hover: #5e5e5e;
+  --btn-ink: #eaeaea;
+  --btn-emboss: #111111;
+
+  --upload-hover: #383838;
+
+  /* Status text — lightened so it clears contrast on a dark panel */
+  --ok-ink: #7fe07f;
+  --err-ink: #ff8a8a;
+  --warn-ink: #ffd84d;
+
+  /* Scrollbars */
+  --scroll-track: #1a1a1a;
+  --scroll-thumb: #4a4a4a;
+  --scroll-thumb-lt: #6a6a6a;
+  --scroll-thumb-dk: #1c1c1c;
+  }
+}
+
+:root[data-theme="dark"] {
+  /* Chrome — deepened so the panels still read as raised above it */
+  --app-bg-outer: #0b0b0b;
+  --app-bg: #141414;
+  --topbar-bg: #1f1f1f;
+  --ctxbar-bg: #181818;
+  --sidebar-bg: #242424 url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16'%3E%3Crect width='16' height='16' fill='%232c2c2c'/%3E%3Crect x='0' y='0' width='8' height='8' fill='%23313131'/%3E%3C/svg%3E");
+  --wrap-bg: #0d0d0d url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='32' height='32'%3E%3Crect width='32' height='32' fill='%234a3526'/%3E%3Crect x='0' y='0' width='16' height='16' fill='%23523c2c'/%3E%3Crect x='16' y='16' width='16' height='16' fill='%23523c2c'/%3E%3C/svg%3E");
+  --chrome-ink: #cfcfcf;
+  --chrome-ink-faint: #8a8a8a;
+
+  /* Inventory panel — deepslate instead of light stone */
+  --panel-bg: #3a3a3a;
+  --panel-edge-lt: #565656;
+  --panel-edge-dk: #1b1b1b;
+  --panel-rule: #616161;
+
+  /* Inset tiles (stat slots, meters, property fields, drop zones) */
+  --slot-bg: #2a2a2a;
+  --slot-edge-lt: #4e4e4e;
+  --slot-edge-dk: #141414;
+
+  /* Raised rows (server cards, player rows) */
+  --row-bg: #333333;
+  --row-edge-lt: #4e4e4e;
+  --row-edge-dk: #161616;
+
+  /* Property groups */
+  --group-bg: #333333;
+  --group-edge-lt: #4a4a4a;
+  --group-edge-dk: #1e1e1e;
+  --group-hover: #3f3f3f;
+
+  /* Text on panels. The bevel emboss flips from a white highlight to a
+     black drop shadow, which is what keeps the pixel lettering readable. */
+  --ink: #e6e6e6;
+  --ink-title: #dcdcdc;
+  --ink-heading: #cfcfcf;
+  --ink-soft: #c4c4c4;
+  --ink-meta: #b4b4b4;
+  --ink-faint: #a3a3a3;
+  --emboss: #000000;
+  --emboss-soft: #121212;
+
+  /* Dividers and disclosure markers */
+  --divider: #565656;
+  --divider-dash: #4e4e4e;
+  --marker: #b0b0b0;
+  --rule-bg: #2a2a2a;
+  --rule-lt: #4a4a4a;
+  --rule-dk: #141414;
+  --meter-track: #171717;
+
+  /* Buttons */
+  --btn-face: #4d4d4d;
+  --btn-light: #6e6e6e;
+  --btn-dark: #1c1c1c;
+  --btn-hover: #5e5e5e;
+  --btn-ink: #eaeaea;
+  --btn-emboss: #111111;
+
+  --upload-hover: #383838;
+
+  /* Status text — lightened so it clears contrast on a dark panel */
+  --ok-ink: #7fe07f;
+  --err-ink: #ff8a8a;
+  --warn-ink: #ffd84d;
+
+  /* Scrollbars */
+  --scroll-track: #1a1a1a;
+  --scroll-thumb: #4a4a4a;
+  --scroll-thumb-lt: #6a6a6a;
+  --scroll-thumb-dk: #1c1c1c;
+}
+
+/* Repaint smoothly when the theme flips, but never animate layout. */
+body,
+.mc-wrap,
+.mc-topbar,
+.ctx-bar,
+.mc-sidebar,
+.mc-main,
+.inv-panel,
+.modal-box,
+.prop-group,
+.slot,
+.stat-slot,
+.h-block,
+.prop-slot,
+.upload-zone,
+.srv-card,
+.p-row {
+  transition: background-color .15s linear, border-color .15s linear, color .15s linear;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    transition: none !important;
+  }
+}
+
+
 body {
   font-family: 'VT323', monospace;
   font-size: var(--t-md);
-  background: #141414;
+  background: var(--app-bg-outer);
   color: var(--ink);
   -webkit-font-smoothing: none;
 }
@@ -83,7 +332,7 @@ body {
 /* ── Pixel scrollbars ───────────────────────────────────────────────────── */
 * {
   scrollbar-width: thin;
-  scrollbar-color: #6d6d6d #2a2a2a;
+  scrollbar-color: var(--scroll-thumb) var(--scroll-track);
 }
 
 *::-webkit-scrollbar {
@@ -92,22 +341,22 @@ body {
 }
 
 *::-webkit-scrollbar-track {
-  background: #2a2a2a;
+  background: var(--scroll-track);
 }
 
 *::-webkit-scrollbar-thumb {
-  background: #6d6d6d;
-  border-top: 2px solid #b0b0b0;
-  border-left: 2px solid #b0b0b0;
-  border-right: 2px solid #373737;
-  border-bottom: 2px solid #373737;
+  background: var(--scroll-thumb);
+  border-top: 2px solid var(--scroll-thumb-lt);
+  border-left: 2px solid var(--scroll-thumb-lt);
+  border-right: 2px solid var(--scroll-thumb-dk);
+  border-bottom: 2px solid var(--scroll-thumb-dk);
 }
 
 /* ===========================================================================
    App shell — fixed viewport frame, only the content column scrolls
    =========================================================================== */
 .mc-wrap {
-  background: #1a1a1a url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='32' height='32'%3E%3Crect width='32' height='32' fill='%23866043'/%3E%3Crect x='0' y='0' width='16' height='16' fill='%23916845'/%3E%3Crect x='16' y='16' width='16' height='16' fill='%23916845'/%3E%3C/svg%3E");
+  background: var(--wrap-bg);
   border: 4px solid #000;
   max-width: 1280px;
   height: calc(100vh - 32px);
@@ -121,7 +370,7 @@ body {
 
 /* ── Top bar ────────────────────────────────────────────────────────────── */
 .mc-topbar {
-  background: #2d2d2d;
+  background: var(--topbar-bg);
   border-bottom: 4px solid #000;
   padding: var(--s2) var(--s3);
   display: flex;
@@ -182,7 +431,7 @@ body {
 
 /* ── Context bar: active target + power controls, visible from every panel ── */
 .ctx-bar {
-  background: #232323;
+  background: var(--ctxbar-bg);
   border-bottom: 4px solid #000;
   padding: var(--s2) var(--s3);
   display: flex;
@@ -196,7 +445,7 @@ body {
   font-size: var(--t-xs);
   letter-spacing: 2px;
   text-transform: uppercase;
-  color: #8d8d8d;
+  color: var(--chrome-ink-faint);
 }
 
 .ctx-target {
@@ -228,7 +477,7 @@ body {
 /* ── Sidebar ────────────────────────────────────────────────────────────── */
 .mc-sidebar {
   min-height: 0;
-  background: #3b3b3b url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16'%3E%3Crect width='16' height='16' fill='%23555'/%3E%3Crect x='0' y='0' width='8' height='8' fill='%23595959'/%3E%3C/svg%3E");
+  background: var(--sidebar-bg);
   border-right: 4px solid #000;
   padding: var(--s2) 0;
   overflow-y: auto;
@@ -236,7 +485,7 @@ body {
 
 .sb-sec {
   font-size: var(--t-xs);
-  color: #9d9d9d;
+  color: var(--chrome-ink-faint);
   padding: var(--s3) var(--s3) var(--s1);
   letter-spacing: 2px;
   text-transform: uppercase;
@@ -249,7 +498,7 @@ body {
 .sb-item {
   padding: var(--s1) var(--s3);
   font-size: 17px;
-  color: #ccc;
+  color: var(--chrome-ink);
   cursor: pointer;
   display: flex;
   align-items: center;
@@ -276,7 +525,7 @@ body {
 
 /* ── Content column ─────────────────────────────────────────────────────── */
 .mc-main {
-  background: #1d1d1d;
+  background: var(--app-bg);
   min-height: 0;
   padding: var(--s3);
   overflow-y: auto;
@@ -306,7 +555,7 @@ body {
 
 .panel-head p {
   font-size: var(--t-sm);
-  color: #8d8d8d;
+  color: var(--chrome-ink-faint);
   margin-top: 2px;
 }
 
@@ -314,11 +563,11 @@ body {
    Card (inventory panel)
    =========================================================================== */
 .inv-panel {
-  background: var(--inv-bg);
-  border-top: 3px solid #fff;
-  border-left: 3px solid #fff;
-  border-right: 3px solid #555;
-  border-bottom: 3px solid #555;
+  background: var(--panel-bg);
+  border-top: 3px solid var(--panel-edge-lt);
+  border-left: 3px solid var(--panel-edge-lt);
+  border-right: 3px solid var(--panel-edge-dk);
+  border-bottom: 3px solid var(--panel-edge-dk);
   padding: var(--s3);
   margin-bottom: var(--s3);
 }
@@ -329,11 +578,11 @@ body {
 
 .inv-title {
   font-size: var(--t-lg);
-  color: #3f3f3f;
-  border-bottom: 2px solid #555;
+  color: var(--ink-title);
+  border-bottom: 2px solid var(--panel-rule);
   margin-bottom: var(--s3);
   padding-bottom: var(--s1);
-  text-shadow: 1px 1px #fff;
+  text-shadow: 1px 1px var(--emboss);
   display: flex;
   justify-content: space-between;
   align-items: center;
@@ -354,7 +603,7 @@ details.inv-panel > summary::-webkit-details-marker {
 details.inv-panel > summary::after {
   content: '\25B6';
   font-size: 12px;
-  color: #4f4f4f;
+  color: var(--marker);
   margin-left: auto;
 }
 
@@ -379,11 +628,11 @@ details.inv-panel:not([open]) > summary {
   font-weight: normal;
   text-transform: uppercase;
   letter-spacing: 1px;
-  color: #373737;
-  border-bottom: 1px solid #8b8b8b;
+  color: var(--ink-heading);
+  border-bottom: 1px solid var(--divider);
   padding-bottom: 2px;
   margin-bottom: var(--s2);
-  text-shadow: 1px 1px #ddd;
+  text-shadow: 1px 1px var(--emboss-soft);
 }
 
 .section-heading + .section-heading,
@@ -393,7 +642,7 @@ details.inv-panel:not([open]) > summary {
 
 .card-hint {
   font-size: var(--t-sm);
-  color: #5a5a5a;
+  color: var(--ink-faint);
   margin-bottom: var(--s2);
 }
 
@@ -423,11 +672,11 @@ details.inv-panel:not([open]) > summary {
 .h-block,
 .prop-slot,
 .upload-zone {
-  background: var(--inv-mid);
-  border-top: 2px solid #373737;
-  border-left: 2px solid #373737;
-  border-right: 2px solid #fff;
-  border-bottom: 2px solid #fff;
+  background: var(--slot-bg);
+  border-top: 2px solid var(--slot-edge-dk);
+  border-left: 2px solid var(--slot-edge-dk);
+  border-right: 2px solid var(--slot-edge-lt);
+  border-bottom: 2px solid var(--slot-edge-lt);
 }
 
 .stat-row {
@@ -460,7 +709,7 @@ details.inv-panel:not([open]) > summary {
 .stat-lbl {
   font-size: var(--t-xs);
   color: var(--ink);
-  text-shadow: 1px 1px #ddd;
+  text-shadow: 1px 1px var(--emboss-soft);
   text-transform: uppercase;
   letter-spacing: 1px;
 }
@@ -479,7 +728,7 @@ details.inv-panel:not([open]) > summary {
 .h-lbl {
   font-size: var(--t-xs);
   color: var(--ink);
-  text-shadow: 1px 1px #ccc;
+  text-shadow: 1px 1px var(--emboss-soft);
   text-transform: uppercase;
   letter-spacing: 1px;
   display: flex;
@@ -488,7 +737,7 @@ details.inv-panel:not([open]) > summary {
 }
 
 .h-bar-bg {
-  background: #373737;
+  background: var(--meter-track);
   height: 10px;
   margin-top: var(--s1);
   border: 1px solid #000;
@@ -507,9 +756,9 @@ details.inv-panel:not([open]) > summary {
 /* Divider inside a card */
 .rule {
   height: 4px;
-  background: #8b8b8b;
-  border-top: 1px solid #6d6d6d;
-  border-bottom: 1px solid #e6e6e6;
+  background: var(--rule-bg);
+  border-top: 1px solid var(--rule-dk);
+  border-bottom: 1px solid var(--rule-lt);
   margin: var(--s3) 0;
 }
 
@@ -537,19 +786,19 @@ details.inv-panel:not([open]) > summary {
   border-left: 3px solid var(--btn-light);
   border-right: 3px solid var(--btn-dark);
   border-bottom: 3px solid var(--btn-dark);
-  color: var(--ink);
+  color: var(--btn-ink);
   font-family: 'VT323', monospace;
   font-size: var(--t-md);
   line-height: 1.2;
   padding: var(--s1) 14px;
   cursor: pointer;
-  text-shadow: 1px 1px #ddd;
+  text-shadow: 1px 1px var(--btn-emboss);
   white-space: nowrap;
   transition: background .15s, color .15s;
 }
 
 .mc-btn:hover:not(:disabled) {
-  background: #b0b0b0;
+  background: var(--btn-hover);
   color: var(--mc-yellow);
 }
 
@@ -679,8 +928,8 @@ option {
   font-size: var(--t-xs);
   text-transform: uppercase;
   letter-spacing: 1px;
-  color: #3f3f3f;
-  text-shadow: 1px 1px #e2e2e2;
+  color: var(--ink-title);
+  text-shadow: 1px 1px var(--emboss-soft);
 }
 
 .grid-auto {
@@ -705,7 +954,7 @@ option {
 }
 
 .check-row label {
-  color: #333;
+  color: var(--ink);
   font-size: var(--t-md);
   cursor: pointer;
 }
@@ -718,12 +967,22 @@ option {
   flex-wrap: wrap;
   margin-top: var(--s3);
   padding-top: var(--s2);
-  border-top: 2px solid #8b8b8b;
+  border-top: 2px solid var(--divider);
 }
 
 .save-hint {
   font-size: 15px;
-  color: #5a5a5a;
+  color: var(--ink-faint);
+}
+
+/* Set by saveProps()/updatePropMemory() instead of an inline colour, so the
+   hint stays legible on both themes. */
+.save-hint.dirty {
+  color: var(--warn-ink);
+}
+
+.save-hint.saved {
+  color: var(--ok-ink);
 }
 
 /* ===========================================================================
@@ -762,12 +1021,12 @@ option {
    Lists — server nodes, players, registries, backups, jobs
    =========================================================================== */
 .srv-card {
-  background: var(--inv-mid);
+  background: var(--row-bg);
   padding: var(--s2) var(--s3);
-  border-top: 2px solid #fff;
-  border-left: 2px solid #fff;
-  border-right: 2px solid #373737;
-  border-bottom: 2px solid #373737;
+  border-top: 2px solid var(--row-edge-lt);
+  border-left: 2px solid var(--row-edge-lt);
+  border-right: 2px solid var(--row-edge-dk);
+  border-bottom: 2px solid var(--row-edge-dk);
   display: flex;
   justify-content: space-between;
   align-items: center;
@@ -783,7 +1042,7 @@ option {
 .srv-name {
   font-size: var(--t-lg);
   color: var(--ink);
-  text-shadow: 1px 1px #ddd;
+  text-shadow: 1px 1px var(--emboss-soft);
   display: flex;
   align-items: center;
   gap: var(--s2);
@@ -791,7 +1050,7 @@ option {
 
 .srv-meta {
   font-size: 13px;
-  color: #3a3a3a;
+  color: var(--ink-meta);
 }
 
 .status-dot {
@@ -813,11 +1072,11 @@ option {
 }
 
 .p-row {
-  background: var(--inv-mid);
-  border-top: 2px solid #fff;
-  border-left: 2px solid #fff;
-  border-right: 2px solid #373737;
-  border-bottom: 2px solid #373737;
+  background: var(--row-bg);
+  border-top: 2px solid var(--row-edge-lt);
+  border-left: 2px solid var(--row-edge-lt);
+  border-right: 2px solid var(--row-edge-dk);
+  border-bottom: 2px solid var(--row-edge-dk);
   padding: var(--s1) var(--s2);
   display: flex;
   align-items: center;
@@ -841,7 +1100,7 @@ option {
   flex: 1;
   min-width: 0;
   color: var(--ink);
-  text-shadow: 1px 1px #ddd;
+  text-shadow: 1px 1px var(--emboss-soft);
   overflow: hidden;
   text-overflow: ellipsis;
 }
@@ -853,9 +1112,9 @@ option {
   align-items: center;
   gap: var(--s2);
   padding: var(--s1) 2px;
-  border-bottom: 1px dashed #9a9a9a;
+  border-bottom: 1px dashed var(--divider-dash);
   font-size: var(--t-sm);
-  color: #1a1a1a;
+  color: var(--ink);
 }
 
 .list-row:last-child {
@@ -872,7 +1131,7 @@ option {
 
 .list-row .row-sub {
   font-size: var(--t-xs);
-  color: #555;
+  color: var(--ink-faint);
 }
 
 .mono {
@@ -887,7 +1146,7 @@ option {
 
 /* Placeholder text used for every "nothing here yet" state */
 .empty {
-  color: #5f5f5f;
+  color: var(--ink-faint);
   font-size: var(--t-sm);
   font-style: italic;
   padding: var(--s2) 2px;
@@ -895,7 +1154,7 @@ option {
 }
 
 .empty.err {
-  color: #8b1a1a;
+  color: var(--err-ink);
   font-style: normal;
 }
 
@@ -915,11 +1174,11 @@ option {
 
 .prop-group {
   margin-bottom: var(--s2);
-  border-top: 2px solid #d8d8d8;
-  border-left: 2px solid #d8d8d8;
-  border-right: 2px solid #9a9a9a;
-  border-bottom: 2px solid #9a9a9a;
-  background: #bdbdbd;
+  border-top: 2px solid var(--group-edge-lt);
+  border-left: 2px solid var(--group-edge-lt);
+  border-right: 2px solid var(--group-edge-dk);
+  border-bottom: 2px solid var(--group-edge-dk);
+  background: var(--group-bg);
 }
 
 .prop-group[hidden] {
@@ -930,8 +1189,8 @@ option {
   cursor: pointer;
   padding: var(--s1) var(--s2);
   font-size: 17px;
-  color: #2f2f2f;
-  text-shadow: 1px 1px #ddd;
+  color: var(--ink-title);
+  text-shadow: 1px 1px var(--emboss-soft);
   text-transform: uppercase;
   letter-spacing: 1px;
   list-style: none;
@@ -948,7 +1207,7 @@ option {
 .prop-group > summary::before {
   content: '\25B6';
   font-size: 11px;
-  color: #4f4f4f;
+  color: var(--marker);
 }
 
 .prop-group[open] > summary::before {
@@ -956,13 +1215,13 @@ option {
 }
 
 .prop-group > summary:hover {
-  background: #cacaca;
+  background: var(--group-hover);
 }
 
 .prop-count {
   margin-left: auto;
   font-size: var(--t-xs);
-  color: #5a5a5a;
+  color: var(--ink-faint);
 }
 
 .prop-grid {
@@ -988,7 +1247,7 @@ option {
 .prop-lbl {
   font-size: 11px;
   line-height: 1.5;
-  color: #1f1f1f;
+  color: var(--ink);
   text-transform: uppercase;
   letter-spacing: 1px;
   margin-bottom: 2px;
@@ -1004,7 +1263,7 @@ option {
   padding: var(--s5) var(--s3);
   text-align: center;
   cursor: pointer;
-  color: #333;
+  color: var(--ink-soft);
   font-size: var(--t-md);
   margin-bottom: var(--s2);
   transition: background .15s;
@@ -1018,22 +1277,22 @@ option {
 
 .upload-zone:hover,
 .upload-zone.drag {
-  background: #a5a5a5;
+  background: var(--upload-hover);
   color: var(--ink);
 }
 
 .status-line {
   font-size: var(--t-sm);
   min-height: 18px;
-  color: #3a3a3a;
+  color: var(--ink-meta);
 }
 
 .status-line .ok {
-  color: #1a5c1a;
+  color: var(--ok-ink);
 }
 
 .status-line .err {
-  color: #8b1a1a;
+  color: var(--err-ink);
 }
 
 /* ===========================================================================
@@ -1055,11 +1314,11 @@ option {
 }
 
 .modal-box {
-  background: var(--inv-bg);
-  border-top: 4px solid #fff;
-  border-left: 4px solid #fff;
-  border-right: 4px solid #555;
-  border-bottom: 4px solid #555;
+  background: var(--panel-bg);
+  border-top: 4px solid var(--panel-edge-lt);
+  border-left: 4px solid var(--panel-edge-lt);
+  border-right: 4px solid var(--panel-edge-dk);
+  border-bottom: 4px solid var(--panel-edge-dk);
   padding: var(--s3);
   width: 100%;
   max-width: 780px;
@@ -1070,9 +1329,9 @@ option {
 
 .modal-title {
   font-size: var(--t-xl);
-  color: #3f3f3f;
-  text-shadow: 1px 1px #fff;
-  border-bottom: 2px solid #555;
+  color: var(--ink-title);
+  text-shadow: 1px 1px var(--emboss);
+  border-bottom: 2px solid var(--panel-rule);
   margin-bottom: var(--s2);
   padding-bottom: var(--s1);
   display: flex;
@@ -1095,7 +1354,7 @@ option {
   flex-wrap: wrap;
   margin-bottom: var(--s2);
   padding-bottom: var(--s2);
-  border-bottom: 2px solid #8b8b8b;
+  border-bottom: 2px solid var(--divider);
 }
 
 .mc-btn.tab.active {

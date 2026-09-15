@@ -70,6 +70,62 @@ const PROP_GROUPS = [
 const PASSIVE_PANELS = new Set(['properties', 'world', 'upload', 'mods', 'automation']);
 
 // ---------------------------------------------------------------------------
+// Theme (day / night)
+//
+// With nothing stored the CSS follows prefers-color-scheme on its own; a
+// stored choice pins it via data-theme on <html>. index.html applies that
+// attribute before first paint, so this only keeps the button in sync and
+// handles the toggle.
+// ---------------------------------------------------------------------------
+const THEME_KEY = 'mc-theme';
+
+function prefersDark() {
+  return !!(window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches);
+}
+
+function effectiveTheme() {
+  const pinned = document.documentElement.getAttribute('data-theme');
+  if (pinned === 'dark' || pinned === 'light') return pinned;
+  return prefersDark() ? 'dark' : 'light';
+}
+
+// The button advertises the theme it will switch TO, not the current one.
+function syncThemeButton() {
+  const btn = document.getElementById('btn-theme');
+  if (!btn) return;
+  const isDark = effectiveTheme() === 'dark';
+  btn.innerHTML = isDark
+    ? '<i class="ti ti-sun"></i> DAY'
+    : '<i class="ti ti-moon"></i> NIGHT';
+  btn.title = isDark ? 'Switch to the day theme' : 'Switch to the night theme';
+  btn.setAttribute('aria-pressed', String(isDark));
+}
+
+function toggleTheme() {
+  const next = effectiveTheme() === 'dark' ? 'light' : 'dark';
+  document.documentElement.setAttribute('data-theme', next);
+  try {
+    localStorage.setItem(THEME_KEY, next);
+  } catch (e) {
+    toast('Theme applied, but it could not be saved for next time.', 'info');
+  }
+  syncThemeButton();
+}
+
+function initTheme() {
+  syncThemeButton();
+  // Keep following the OS for as long as the user has not pinned a theme.
+  if (window.matchMedia) {
+    const mq = window.matchMedia('(prefers-color-scheme: dark)');
+    const onChange = () => {
+      if (!document.documentElement.hasAttribute('data-theme')) syncThemeButton();
+    };
+    if (mq.addEventListener) mq.addEventListener('change', onChange);
+    else if (mq.addListener) mq.addListener(onChange);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Toast notification system
 // ---------------------------------------------------------------------------
 function toast(msg, type = 'info') {
@@ -108,6 +164,7 @@ document.addEventListener('DOMContentLoaded', () => {
   populateVersionsDynamically();
   renderRconCommands();
   renderModalTabs();
+  initTheme();
 });
 
 // ---------------------------------------------------------------------------
@@ -688,7 +745,8 @@ function updatePropMemory(key, val) {
   updateOverviewTags();
   ['save-hint-props', 'save-hint-world'].forEach(id => {
     const el = document.getElementById(id);
-    el.textContent = '* Unsaved changes'; el.style.color = '#8a6d00';
+    el.textContent = '* Unsaved changes';
+    el.className = 'save-hint dirty';
   });
 }
 
@@ -715,8 +773,12 @@ async function saveProps() {
 
   ['save-hint-props', 'save-hint-world'].forEach(id => {
     const el = document.getElementById(id);
-    el.textContent = '[SAVED]'; el.style.color = '#1a5c1a';
-    setTimeout(() => { el.textContent = ''; }, 3000);
+    el.textContent = '[SAVED]';
+    el.className = 'save-hint saved';
+    setTimeout(() => {
+      el.textContent = '';
+      el.className = 'save-hint';
+    }, 3000);
   });
 }
 

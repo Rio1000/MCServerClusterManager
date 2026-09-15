@@ -7,6 +7,15 @@
   <title>Minecraft Server Cluster Console</title>
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@tabler/icons-webfont@latest/tabler-icons.min.css">
   <link rel="stylesheet" href="style.css">
+  <script>
+    // Apply the saved theme before first paint, otherwise a night-theme user
+    // on a light OS gets a flash of the day palette. Everything else lives in
+    // script.js; with no stored choice the CSS follows prefers-color-scheme.
+    try {
+      var t = localStorage.getItem('mc-theme');
+      if (t === 'dark' || t === 'light') document.documentElement.setAttribute('data-theme', t);
+    } catch (e) { /* storage blocked — fall back to the OS preference */ }
+  </script>
 </head>
 
 <body>
@@ -21,6 +30,8 @@
       <div class="grass-icon"></div>
       <span class="mc-title">CLUSTER MANAGER</span>
       <span class="topbar-spacer"></span>
+      <button id="btn-theme" class="mc-btn sm" onclick="toggleTheme()" aria-pressed="false"
+        title="Switch theme">THEME</button>
       <span class="pill pill-off" id="status-pill">NO SERVER SELECTED</span>
     </div>
 
