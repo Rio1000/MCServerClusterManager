@@ -332,7 +332,7 @@ function sw(id, el) {
 
   // Auto-fetch on panel open
   if (id === 'automation') { loadBackups(); loadJobs(); }
-  if (id === 'mods') { loadInstalledAddons(); }
+  if (id === 'mods') { loadInstalledAddons(); refreshPackwizStatus(); }
   if (id === 'players') { requestPlayerList(); }
 }
 
@@ -511,6 +511,7 @@ async function createServer() {
   const snapshot = document.getElementById('new-snapshot').checked;
   const port = document.getElementById('new-port').value.trim() || '25565';
   const memory = document.getElementById('new-memory').value.trim() || '2G';
+  const extraPorts = document.getElementById('new-extra-ports').value.trim();
 
   if (!name) { toast('Container ID is required.', 'error'); return; }
 
@@ -531,7 +532,7 @@ async function createServer() {
 
   const res = await fetch('/api/server/create', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ name, type, version, snapshot, port, memory }),
+    body: JSON.stringify({ name, type, version, snapshot, port, memory, extra_ports: extraPorts }),
   }).catch(() => null);
 
   btn.disabled = false;
@@ -893,6 +894,68 @@ async function uploadDatapackFile(file) {
   statusBox.innerHTML = `<span class="ok">${escapeHtml(data.message || 'Uploaded.')}</span>`;
   toast(data.message || 'Datapack uploaded.', 'ok');
   loadInstalledAddons();
+}
+
+// ---------------------------------------------------------------------------
+// Packwiz — host binary + per-server pack
+//
+// Upstream publishes no tagged release (its CI only uploads GitHub Actions
+// artifacts, which need an authenticated fetch), so the daemon builds packwiz
+// from source with `go install`. That takes minutes on first run.
+// ---------------------------------------------------------------------------
+function addExtraPort(spec) {
+  const el = document.getElementById('new-extra-ports');
+  if (!el) return;
+  const parts = el.value.split(/[,\s]+/).filter(Boolean);
+  if (!parts.includes(spec)) parts.push(spec);
+  el.value = parts.join(', ');
+}
+
+async function refreshPackwizStatus() {
+  const el = document.getElementById('packwiz-status');
+  if (!el) return;
+  const res = await fetch('/api/packwiz/status').catch(() => null);
+  if (!res || !res.ok) {
+    el.innerHTML = '<span class="err">Could not reach the daemon.</span>';
+    return;
+  }
+  const d = await res.json().catch(() => ({}));
+  if (d.installed) {
+    el.innerHTML = `<span class="ok">Installed${d.version ? ' — ' + escapeHtml(d.version) : ''}</span>`;
+  } else if (d.go_available) {
+    el.textContent = 'Not installed. Setting up builds it from source — allow a few minutes.';
+  } else {
+    el.innerHTML = '<span class="err">Not installed, and the host has no Go toolchain to '
+      + 'build it with. Install Go 1.24+ on the host first.</span>';
+  }
+}
+
+async function setupPackwiz() {
+  if (!activeServer) { toast('Select a target server first.', 'error'); return; }
+  const btn = document.getElementById('btn-packwiz-setup');
+  const label = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = 'SETTING UP — THIS CAN TAKE A FEW MINUTES';
+  logTerm(`Setting up packwiz for ${activeServer}...`);
+
+  const res = await fetch(`/api/server/${activeServer}/packwiz/setup`, { method: 'POST' })
+    .catch(() => null);
+
+  btn.disabled = false;
+  btn.textContent = label;
+
+  if (!res || !res.ok) {
+    const d = res ? await res.json().catch(() => ({})) : {};
+    const msg = d.detail || 'Packwiz setup failed.';
+    logTerm(msg, true);
+    toast(msg, 'error');
+    refreshPackwizStatus();
+    return;
+  }
+  const d = await res.json().catch(() => ({}));
+  logTerm(d.message || 'Packwiz ready.');
+  toast(d.message || 'Packwiz ready.', 'ok');
+  refreshPackwizStatus();
 }
 
 async function runPackwiz(action) {

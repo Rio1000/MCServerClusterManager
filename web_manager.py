@@ -27,6 +27,21 @@ JOBS_FILE     = os.path.join(DATA_DIR, "_jobs.json")
 TEMPLATES_FILE = os.path.join(DATA_DIR, "_templates.json")
 AUDIT_LOG     = os.path.join(DATA_DIR, "_audit.log")
 
+# packwiz has no tagged releases upstream — its CI only publishes GitHub
+# Actions artifacts, which need an authenticated API call to fetch. So the
+# only official, unauthenticated way to obtain it is to build from source.
+# The binary is kept beside the server data rather than installed system-wide,
+# so this never needs root and never touches anything outside DATA_DIR.
+PACKWIZ_MODULE  = "github.com/packwiz/packwiz@latest"
+PACKWIZ_BIN_DIR = os.path.join(DATA_DIR, "_bin")
+PACKWIZ_BIN     = os.path.join(PACKWIZ_BIN_DIR, "packwiz")
+
+# packwiz knows about mod loaders, not server software; Paper/Spigot/Vanilla
+# and the proxies all init with no loader.
+PACKWIZ_LOADERS = {
+    "FABRIC": "fabric", "FORGE": "forge", "NEOFORGE": "neoforge", "QUILT": "quilt",
+}
+
 _NAME_RE = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9_\-]{0,63}$')
 
 def validate_name(name: str) -> str:
@@ -99,6 +114,122 @@ def _get_containers() -> list[dict]:
         if len(parts) >= 2:
             servers.append({"name": parts[0], "status": parts[1], "ports": parts[2] if len(parts) > 2 else ""})
     return servers
+
+# Accepts "19132", "19132/udp", "25566:25565" or "19132:19132/udp".
+_PORT_SPEC_RE = re.compile(r'^(?:(\d{1,5}):)?(\d{1,5})(?:/(tcp|udp))?$', re.I)
+
+# docker ps renders bindings as "0.0.0.0:25565->25565/tcp, :::25565->25565/tcp"
+_BOUND_PORT_RE = re.compile(r':(\d{1,5})->\d{1,5}/(tcp|udp)')
+
+
+def _parse_port_spec(spec: str) -> dict:
+    m = _PORT_SPEC_RE.match(str(spec).strip())
+    if not m:
+        raise HTTPException(
+            400, f"Invalid port '{spec}'. Use PORT, PORT/udp, or HOST:CONTAINER/udp.")
+    container = int(m.group(2))
+    host      = int(m.group(1) or container)
+    proto     = (m.group(3) or "tcp").lower()
+    for value in (host, container):
+        if not (1 <= value <= 65535):
+            raise HTTPException(400, f"Port {value} is out of range (1-65535).")
+    return {"host": host, "container": container, "proto": proto}
+
+
+def _bound_host_ports() -> set[tuple[int, str]]:
+    """Every (host port, protocol) already bound by a managed container."""
+    bound: set[tuple[int, str]] = set()
+    for srv in _get_containers():
+        for host, proto in _BOUND_PORT_RE.findall(srv.get("ports", "")):
+            bound.add((int(host), proto))
+    return bound
+
+
+def _docker_env(name: str) -> dict[str, str]:
+    code, out, _ = _run(
+        ["docker", "inspect", "-f", "{{range .Config.Env}}{{println .}}{{end}}", name])
+    env: dict[str, str] = {}
+    if code == 0:
+        for line in out.splitlines():
+            if "=" in line:
+                k, v = line.split("=", 1)
+                env[k.strip()] = v.strip()
+    return env
+
+
+def _packwiz_path() -> str | None:
+    """Our managed build first, then anything the admin already put on PATH."""
+    if os.path.isfile(PACKWIZ_BIN) and os.access(PACKWIZ_BIN, os.X_OK):
+        return PACKWIZ_BIN
+    return shutil.which("packwiz")
+
+
+def _packwiz_version(path: str) -> str:
+    try:
+        r = subprocess.run([path, "--version"], capture_output=True, text=True,
+                           check=False, timeout=15)
+        return (r.stdout or r.stderr).strip().splitlines()[0] if r.returncode == 0 else ""
+    except Exception:
+        return ""
+
+
+def _require_packwiz() -> str:
+    path = _packwiz_path()
+    if not path:
+        raise HTTPException(
+            503, "packwiz is not installed. Use 'Set Up Packwiz' on the Mods page first.")
+    return path
+
+
+async def _install_packwiz() -> str:
+    """Build packwiz from source into PACKWIZ_BIN_DIR. Takes a few minutes."""
+    existing = _packwiz_path()
+    if existing:
+        return existing
+    go = shutil.which("go")
+    if not go:
+        raise HTTPException(
+            503,
+            "packwiz has no prebuilt release to download, so it is built from source "
+            "and that needs the Go toolchain. Install Go 1.24+ on the host "
+            "(https://go.dev/dl/) and try again.")
+    os.makedirs(PACKWIZ_BIN_DIR, exist_ok=True)
+    env = {**os.environ, "GOBIN": PACKWIZ_BIN_DIR}
+    env.setdefault("HOME", DATA_DIR)  # go needs a writable HOME for its build cache
+
+    def _build():
+        return subprocess.run([go, "install", PACKWIZ_MODULE], env=env,
+                              capture_output=True, text=True, check=False, timeout=900)
+    try:
+        r = await asyncio.to_thread(_build)
+    except subprocess.TimeoutExpired:
+        raise HTTPException(504, "Building packwiz timed out after 15 minutes.")
+    if r.returncode != 0:
+        detail = (r.stderr or r.stdout).strip()[:500] or "unknown error"
+        raise HTTPException(500, f"go install failed: {detail}")
+    if not os.path.isfile(PACKWIZ_BIN):
+        raise HTTPException(
+            500, f"go install succeeded but no binary appeared in {PACKWIZ_BIN_DIR}.")
+    os.chmod(PACKWIZ_BIN, 0o755)
+    return PACKWIZ_BIN
+
+
+def _packwiz_init_args(name: str, env: dict[str, str]) -> list[str]:
+    """Non-interactive `packwiz init` flags derived from the container's env."""
+    loader = PACKWIZ_LOADERS.get(env.get("TYPE", "").upper(), "none")
+    args = ["init", "-y", "--name", name, "--author", "ClusterManager",
+            "--modloader", loader]
+    version = env.get("VERSION", "").strip().upper()
+    if version == "SNAPSHOT":
+        args += ["--latest", "-s"]
+    elif not version or version == "LATEST":
+        args.append("--latest")
+    else:
+        args += ["--mc-version", env["VERSION"].strip()]
+    if loader != "none":
+        args.append(f"--{loader}-latest")
+    return args
+
 
 def _parse_properties(server_name: str) -> dict | None:
     filepath = safe_path(DATA_DIR, server_name, "server.properties")
@@ -188,17 +319,39 @@ async def create_server(request: Request):
     if not re.match(r'^\d+[MmGg]$', memory):
         raise HTTPException(400, "Invalid memory value (e.g. 2G, 512M).")
 
-    existing = _get_containers()
-    for s in existing:
-        if port in s.get("ports", ""):
-            raise HTTPException(409, f"Port {port} already bound by '{s['name']}'.")
+    # Extra bindings for things that listen outside the Java port — Geyser's
+    # Bedrock port and Simple Voice Chat are both UDP, so the protocol has to
+    # travel with the number. Docker can only set these at creation time.
+    extra_raw = data.get("extra_ports", [])
+    if isinstance(extra_raw, str):
+        extra_raw = re.split(r'[,\s]+', extra_raw.strip())
+    extra_raw = [x for x in (extra_raw or []) if str(x).strip()]
+    if len(extra_raw) > 20:
+        raise HTTPException(400, "Too many extra ports (max 20).")
+
+    bindings = [{"host": int(port), "container": 25565, "proto": "tcp"}]
+    bindings += [_parse_port_spec(x) for x in extra_raw]
+
+    seen: set[tuple[int, str]] = set()
+    for b in bindings:
+        key = (b["host"], b["proto"])
+        if key in seen:
+            raise HTTPException(400, f"Port {b['host']}/{b['proto']} is listed twice.")
+        seen.add(key)
+
+    taken = _bound_host_ports()
+    for b in bindings:
+        if (b["host"], b["proto"]) in taken:
+            raise HTTPException(
+                409, f"Port {b['host']}/{b['proto']} is already bound by another container.")
 
     server_path = safe_path(DATA_DIR, name)
     os.makedirs(server_path, exist_ok=True)
 
-    cmd = [
-        "docker", "run", "-d", "-it", "--name", name,
-        "-p", f"{port}:25565",
+    cmd = ["docker", "run", "-d", "-it", "--name", name]
+    for b in bindings:
+        cmd += ["-p", f"{b['host']}:{b['container']}/{b['proto']}"]
+    cmd += [
         "-e", "EULA=TRUE",
         "-e", f"TYPE={server_type}",
         "-e", f"VERSION={'SNAPSHOT' if is_snapshot else version}",
@@ -210,8 +363,11 @@ async def create_server(request: Request):
     if code != 0:
         raise HTTPException(500, f"Docker error: {err}")
 
-    audit("DEPLOY", name, f"type={server_type} version={version} port={port} memory={memory}")
-    return JSONResponse({"message": f"Server '{name}' deployed."})
+    bound = " ".join(f"{b['host']}:{b['container']}/{b['proto']}" for b in bindings)
+    audit("DEPLOY", name,
+          f"type={server_type} version={version} memory={memory} ports={bound}")
+    extra_note = f" ({len(bindings) - 1} extra port(s) bound)" if len(bindings) > 1 else ""
+    return JSONResponse({"message": f"Server '{name}' deployed.{extra_note}"})
 
 @app.post("/api/server/{name}/action")
 async def server_action(request: Request, name: str = Path(...)):
@@ -326,18 +482,66 @@ async def packwiz_exec(request: Request, name: str = Path(...)):
     server_path = safe_path(DATA_DIR, name)
     if not os.path.exists(server_path):
         raise HTTPException(404, "Container volume missing.")
+    packwiz = _require_packwiz()
     pack_toml = os.path.join(server_path, "pack.toml")
     if not os.path.exists(pack_toml):
-        code, _, err = _run(["packwiz", "init", "--name", name, "--author", "Admin"])
-        if code != 0:
-            raise HTTPException(500, f"Packwiz init failed: {err}")
-    res = subprocess.run(["packwiz", "modrinth", action, mod_slug, "-y"],
+        # This used to run without cwd, so it wrote pack.toml into the manager's
+        # own directory and re-ran on every add. It has to run in the volume.
+        init = subprocess.run([packwiz] + _packwiz_init_args(name, _docker_env(name)),
+                              cwd=server_path, capture_output=True, text=True, check=False)
+        if init.returncode != 0:
+            raise HTTPException(500, f"Packwiz init failed: {init.stderr.strip()[:400]}")
+    res = subprocess.run([packwiz, "modrinth", action, mod_slug, "-y"],
                          cwd=server_path, capture_output=True, text=True, check=False)
     if res.returncode != 0:
         raise HTTPException(500, f"Packwiz error: {res.stderr.strip()}")
-    subprocess.run(["packwiz", "refresh"], cwd=server_path, capture_output=True, check=False)
+    subprocess.run([packwiz, "refresh"], cwd=server_path, capture_output=True, check=False)
     audit("PACKWIZ", name, f"action={action} mod={mod_slug}")
     return JSONResponse({"message": f"Packwiz {action} completed for '{mod_slug}'."})
+
+@app.get("/api/packwiz/status")
+async def packwiz_status():
+    path = _packwiz_path()
+    return JSONResponse({
+        "installed": bool(path),
+        "path": path or "",
+        "version": _packwiz_version(path) if path else "",
+        "go_available": bool(shutil.which("go")),
+        "install_dir": PACKWIZ_BIN_DIR,
+    })
+
+
+@app.post("/api/server/{name}/packwiz/setup")
+async def packwiz_setup(name: str = Path(...)):
+    """Install packwiz if the host lacks it, then init the pack for this server."""
+    validate_name(name)
+    server_path = safe_path(DATA_DIR, name)
+    if not os.path.exists(server_path):
+        raise HTTPException(404, "Container volume missing.")
+
+    was_installed = bool(_packwiz_path())
+    packwiz = await _install_packwiz()
+
+    pack_toml = os.path.join(server_path, "pack.toml")
+    already_init = os.path.exists(pack_toml)
+    if not already_init:
+        env = _docker_env(name)
+        init = subprocess.run([packwiz] + _packwiz_init_args(name, env),
+                              cwd=server_path, capture_output=True, text=True, check=False)
+        if init.returncode != 0:
+            raise HTTPException(500, f"Packwiz init failed: {init.stderr.strip()[:400]}")
+
+    steps = []
+    steps.append("packwiz already installed" if was_installed else "packwiz built and installed")
+    steps.append("pack already initialised" if already_init else "pack initialised")
+    audit("PACKWIZ_SETUP", name, "; ".join(steps))
+    return JSONResponse({
+        "message": f"Packwiz ready for '{name}' — " + "; ".join(steps) + ".",
+        "installed": True,
+        "version": _packwiz_version(packwiz),
+        "initialised": True,
+    })
+
 
 @app.post("/api/server/{name}/datapacks/upload")
 async def upload_datapack(name: str = Path(...), file: UploadFile = File(...)):

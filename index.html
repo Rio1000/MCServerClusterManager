@@ -143,7 +143,24 @@
                 <label class="field-lbl" for="new-memory">Memory</label>
                 <input type="text" id="new-memory" class="mc-input" placeholder="2G" value="2G">
               </div>
+              <div class="field wide">
+                <label class="field-lbl" for="new-extra-ports">Extra Ports</label>
+                <input type="text" id="new-extra-ports" class="mc-input"
+                  placeholder="19132/udp, 24454/udp">
+              </div>
             </div>
+
+            <div class="btn-row" style="margin-top:4px;align-items:center;">
+              <span class="save-hint">Quick add:</span>
+              <button type="button" class="mc-btn sm" onclick="addExtraPort('19132/udp')">Bedrock 19132/udp</button>
+              <button type="button" class="mc-btn sm" onclick="addExtraPort('24454/udp')">Voice Chat 24454/udp</button>
+              <button type="button" class="mc-btn sm" onclick="addExtraPort('25575')">RCON 25575</button>
+            </div>
+            <p class="card-hint" style="margin-top:6px;">
+              One per entry: <code>PORT</code>, <code>PORT/udp</code>, or <code>HOST:CONTAINER/udp</code>.
+              Bedrock and Simple Voice Chat are UDP. Docker fixes bindings when the container is
+              created, so these cannot be added to a server later.
+            </p>
 
             <div class="check-row">
               <input type="checkbox" id="new-snapshot">
@@ -349,7 +366,17 @@
           <div class="col-2">
             <div class="stack">
               <div class="inv-panel">
-                <div class="inv-title"><span>Packwiz Dependency Engine</span></div>
+                <div class="inv-title">
+                  <span>Packwiz Dependency Engine</span>
+                  <div class="title-actions">
+                    <button class="mc-btn sm" onclick="refreshPackwizStatus()">REFRESH</button>
+                  </div>
+                </div>
+                <div id="packwiz-status" class="status-line">Checking packwiz&hellip;</div>
+                <button id="btn-packwiz-setup" class="mc-btn green block" onclick="setupPackwiz()">
+                  SET UP PACKWIZ FOR THIS SERVER</button>
+
+                <h4 class="section-heading">Modrinth</h4>
                 <div class="field">
                   <label class="field-lbl" for="mod-slug">Modrinth Slug</label>
                   <input type="text" id="mod-slug" class="mc-input" placeholder="e.g. sodium">
