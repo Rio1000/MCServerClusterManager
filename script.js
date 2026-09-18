@@ -70,6 +70,62 @@ const PROP_GROUPS = [
 const PASSIVE_PANELS = new Set(['properties', 'world', 'upload', 'mods', 'automation']);
 
 // ---------------------------------------------------------------------------
+// Theme (day / night)
+//
+// With nothing stored the CSS follows prefers-color-scheme on its own; a
+// stored choice pins it via data-theme on <html>. index.html applies that
+// attribute before first paint, so this only keeps the button in sync and
+// handles the toggle.
+// ---------------------------------------------------------------------------
+const THEME_KEY = 'mc-theme';
+
+function prefersDark() {
+  return !!(window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches);
+}
+
+function effectiveTheme() {
+  const pinned = document.documentElement.getAttribute('data-theme');
+  if (pinned === 'dark' || pinned === 'light') return pinned;
+  return prefersDark() ? 'dark' : 'light';
+}
+
+// The button advertises the theme it will switch TO, not the current one.
+function syncThemeButton() {
+  const btn = document.getElementById('btn-theme');
+  if (!btn) return;
+  const isDark = effectiveTheme() === 'dark';
+  btn.innerHTML = isDark
+    ? '<i class="ti ti-sun"></i> DAY'
+    : '<i class="ti ti-moon"></i> NIGHT';
+  btn.title = isDark ? 'Switch to the day theme' : 'Switch to the night theme';
+  btn.setAttribute('aria-pressed', String(isDark));
+}
+
+function toggleTheme() {
+  const next = effectiveTheme() === 'dark' ? 'light' : 'dark';
+  document.documentElement.setAttribute('data-theme', next);
+  try {
+    localStorage.setItem(THEME_KEY, next);
+  } catch (e) {
+    toast('Theme applied, but it could not be saved for next time.', 'info');
+  }
+  syncThemeButton();
+}
+
+function initTheme() {
+  syncThemeButton();
+  // Keep following the OS for as long as the user has not pinned a theme.
+  if (window.matchMedia) {
+    const mq = window.matchMedia('(prefers-color-scheme: dark)');
+    const onChange = () => {
+      if (!document.documentElement.hasAttribute('data-theme')) syncThemeButton();
+    };
+    if (mq.addEventListener) mq.addEventListener('change', onChange);
+    else if (mq.addListener) mq.addListener(onChange);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Toast notification system
 // ---------------------------------------------------------------------------
 function toast(msg, type = 'info') {
@@ -108,6 +164,7 @@ document.addEventListener('DOMContentLoaded', () => {
   populateVersionsDynamically();
   renderRconCommands();
   renderModalTabs();
+  initTheme();
 });
 
 // ---------------------------------------------------------------------------
@@ -275,7 +332,7 @@ function sw(id, el) {
 
   // Auto-fetch on panel open
   if (id === 'automation') { loadBackups(); loadJobs(); }
-  if (id === 'mods') { loadInstalledAddons(); }
+  if (id === 'mods') { loadInstalledAddons(); refreshPackwizStatus(); }
   if (id === 'players') { requestPlayerList(); }
 }
 
@@ -454,6 +511,7 @@ async function createServer() {
   const snapshot = document.getElementById('new-snapshot').checked;
   const port = document.getElementById('new-port').value.trim() || '25565';
   const memory = document.getElementById('new-memory').value.trim() || '2G';
+  const extraPorts = document.getElementById('new-extra-ports').value.trim();
 
   if (!name) { toast('Container ID is required.', 'error'); return; }
 
@@ -474,7 +532,7 @@ async function createServer() {
 
   const res = await fetch('/api/server/create', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ name, type, version, snapshot, port, memory }),
+    body: JSON.stringify({ name, type, version, snapshot, port, memory, extra_ports: extraPorts }),
   }).catch(() => null);
 
   btn.disabled = false;
@@ -688,7 +746,8 @@ function updatePropMemory(key, val) {
   updateOverviewTags();
   ['save-hint-props', 'save-hint-world'].forEach(id => {
     const el = document.getElementById(id);
-    el.textContent = '* Unsaved changes'; el.style.color = '#8a6d00';
+    el.textContent = '* Unsaved changes';
+    el.className = 'save-hint dirty';
   });
 }
 
@@ -715,8 +774,12 @@ async function saveProps() {
 
   ['save-hint-props', 'save-hint-world'].forEach(id => {
     const el = document.getElementById(id);
-    el.textContent = '[SAVED]'; el.style.color = '#1a5c1a';
-    setTimeout(() => { el.textContent = ''; }, 3000);
+    el.textContent = '[SAVED]';
+    el.className = 'save-hint saved';
+    setTimeout(() => {
+      el.textContent = '';
+      el.className = 'save-hint';
+    }, 3000);
   });
 }
 
@@ -831,6 +894,68 @@ async function uploadDatapackFile(file) {
   statusBox.innerHTML = `<span class="ok">${escapeHtml(data.message || 'Uploaded.')}</span>`;
   toast(data.message || 'Datapack uploaded.', 'ok');
   loadInstalledAddons();
+}
+
+// ---------------------------------------------------------------------------
+// Packwiz — host binary + per-server pack
+//
+// Upstream publishes no tagged release (its CI only uploads GitHub Actions
+// artifacts, which need an authenticated fetch), so the daemon builds packwiz
+// from source with `go install`. That takes minutes on first run.
+// ---------------------------------------------------------------------------
+function addExtraPort(spec) {
+  const el = document.getElementById('new-extra-ports');
+  if (!el) return;
+  const parts = el.value.split(/[,\s]+/).filter(Boolean);
+  if (!parts.includes(spec)) parts.push(spec);
+  el.value = parts.join(', ');
+}
+
+async function refreshPackwizStatus() {
+  const el = document.getElementById('packwiz-status');
+  if (!el) return;
+  const res = await fetch('/api/packwiz/status').catch(() => null);
+  if (!res || !res.ok) {
+    el.innerHTML = '<span class="err">Could not reach the daemon.</span>';
+    return;
+  }
+  const d = await res.json().catch(() => ({}));
+  if (d.installed) {
+    el.innerHTML = `<span class="ok">Installed${d.version ? ' — ' + escapeHtml(d.version) : ''}</span>`;
+  } else if (d.go_available) {
+    el.textContent = 'Not installed. Setting up builds it from source — allow a few minutes.';
+  } else {
+    el.innerHTML = '<span class="err">Not installed, and the host has no Go toolchain to '
+      + 'build it with. Install Go 1.24+ on the host first.</span>';
+  }
+}
+
+async function setupPackwiz() {
+  if (!activeServer) { toast('Select a target server first.', 'error'); return; }
+  const btn = document.getElementById('btn-packwiz-setup');
+  const label = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = 'SETTING UP — THIS CAN TAKE A FEW MINUTES';
+  logTerm(`Setting up packwiz for ${activeServer}...`);
+
+  const res = await fetch(`/api/server/${activeServer}/packwiz/setup`, { method: 'POST' })
+    .catch(() => null);
+
+  btn.disabled = false;
+  btn.textContent = label;
+
+  if (!res || !res.ok) {
+    const d = res ? await res.json().catch(() => ({})) : {};
+    const msg = d.detail || 'Packwiz setup failed.';
+    logTerm(msg, true);
+    toast(msg, 'error');
+    refreshPackwizStatus();
+    return;
+  }
+  const d = await res.json().catch(() => ({}));
+  logTerm(d.message || 'Packwiz ready.');
+  toast(d.message || 'Packwiz ready.', 'ok');
+  refreshPackwizStatus();
 }
 
 async function runPackwiz(action) {
