@@ -619,6 +619,8 @@ details.inv-panel:not([open]) > summary {
 
 .inv-title .title-actions {
   display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
   gap: var(--s1);
 }
 
@@ -654,14 +656,23 @@ details.inv-panel:not([open]) > summary {
   align-items: start;
 }
 
+.col-2 > * {
+  min-width: 0;
+}
+
 .col-2 > .inv-panel {
   margin-bottom: 0;
 }
 
 .stack {
   display: grid;
+  /* An implicit column is sized to max-content, so a wide card inside a stack
+     would spill past the column the stack itself sits in. Pinning the track to
+     minmax(0, 1fr) makes the cards wrap instead. */
+  grid-template-columns: minmax(0, 1fr);
   gap: var(--s3);
   align-content: start;
+  min-width: 0;
 }
 
 /* ===========================================================================
@@ -1507,5 +1518,341 @@ code {
 
   .ctx-actions .mc-btn {
     flex: 1;
+  }
+}
+
+/* ----- Update modal ----------------------------------------------------- */
+.upd-scope {
+  align-items: flex-start;
+  gap: 8px;
+  padding: 8px;
+  border: 1px solid var(--line, #333);
+  border-radius: 4px;
+  margin-bottom: 6px;
+  cursor: pointer;
+}
+.upd-scope.is-disabled { opacity: .55; cursor: not-allowed; }
+.upd-scope input { margin-top: 3px; }
+.upd-blockers { margin: 4px 0 0 18px; padding: 0; }
+.upd-blockers li { font-size: 12px; line-height: 1.5; }
+#upd-log:empty { display: none; }
+#upd-state { margin-left: 8px; text-transform: uppercase; font-size: 11px; }
+
+/* ===========================================================================
+   Target gate — with no instance selected the sidebar offers Instances only
+   =========================================================================== */
+body.no-target .needs-target {
+  display: none;
+}
+
+/* ===========================================================================
+   File manager
+   =========================================================================== */
+.fm-bar {
+  display: flex;
+  align-items: center;
+  gap: var(--s2);
+  margin-bottom: var(--s2);
+  flex-wrap: wrap;
+}
+
+.fm-bar .mc-input {
+  flex: 0 1 220px;
+  margin-left: auto;
+}
+
+.fm-crumbs {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 2px;
+  min-width: 0;
+  font-size: var(--t-sm);
+}
+
+.fm-crumb {
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-family: inherit;
+  font-size: var(--t-sm);
+  color: var(--ink);
+  text-shadow: 1px 1px 0 var(--emboss-soft);
+  padding: 2px var(--s1);
+}
+
+.fm-crumb:hover {
+  color: var(--ok-ink);
+  text-decoration: underline;
+}
+
+.fm-crumb-sep {
+  color: var(--ink-faint);
+}
+
+.fm-drop {
+  background: var(--slot-bg);
+  border-top: 2px solid var(--slot-edge-dk);
+  border-left: 2px solid var(--slot-edge-dk);
+  border-right: 2px solid var(--slot-edge-lt);
+  border-bottom: 2px solid var(--slot-edge-lt);
+  padding: var(--s2);
+}
+
+.fm-drop.drag {
+  background: var(--upload-hover);
+  outline: 2px dashed var(--mc-green);
+  outline-offset: -4px;
+}
+
+.fm-list {
+  max-height: clamp(240px, 46vh, 560px);
+  overflow-y: auto;
+}
+
+/* One grid template for the header and every row, so the columns line up
+   without a table and still collapse cleanly on a phone. */
+.fm-row {
+  display: grid;
+  grid-template-columns: 24px minmax(0, 1fr) 90px 170px 110px 176px;
+  align-items: center;
+  gap: var(--s2);
+  padding: 3px var(--s1);
+  border-bottom: 1px dashed var(--divider-dash);
+  font-size: var(--t-sm);
+  color: var(--ink);
+}
+
+.fm-row:last-child {
+  border-bottom: none;
+}
+
+.fm-row:hover:not(.fm-head) {
+  background: var(--group-hover);
+}
+
+.fm-head {
+  font-size: var(--t-xs);
+  text-transform: uppercase;
+  letter-spacing: .5px;
+  color: var(--ink-heading);
+  border-bottom: 2px solid var(--divider);
+}
+
+.fm-c-size,
+.fm-c-time,
+.fm-c-mode {
+  color: var(--ink-meta);
+  font-size: var(--t-xs);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.fm-c-act {
+  display: flex;
+  gap: var(--s1);
+  justify-content: flex-end;
+}
+
+.fm-c-name {
+  min-width: 0;
+}
+
+.fm-name {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  min-width: 0;
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-family: inherit;
+  font-size: var(--t-sm);
+  color: var(--ink);
+  text-align: left;
+  padding: 0;
+}
+
+.fm-name i {
+  color: var(--ink-faint);
+  flex: none;
+}
+
+.fm-name:hover {
+  color: var(--ok-ink);
+  text-decoration: underline;
+}
+
+.fm-row[data-dir="1"] .fm-name {
+  font-weight: bold;
+}
+
+.fm-flag {
+  font-size: var(--t-xs);
+  color: var(--warn-ink);
+  margin-left: var(--s1);
+}
+
+#fm-editor {
+  font-family: monospace;
+  font-size: 13px;
+  min-height: 320px;
+}
+
+/* ===========================================================================
+   Debug
+   =========================================================================== */
+.kv-grid {
+  display: grid;
+  grid-template-columns: minmax(120px, 38%) minmax(0, 1fr);
+  gap: 2px var(--s2);
+  font-size: var(--t-sm);
+}
+
+.kv-k {
+  color: var(--ink-heading);
+  border-bottom: 1px dashed var(--divider-dash);
+  padding: 2px 0;
+}
+
+.kv-v {
+  color: var(--ink);
+  border-bottom: 1px dashed var(--divider-dash);
+  padding: 2px 0;
+  font-family: monospace;
+  font-size: var(--t-xs);
+  word-break: break-word;
+}
+
+.kv-v.ok  { color: var(--ok-ink); }
+.kv-v.err { color: var(--err-ink); }
+
+.dbg-check {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--s2);
+  padding: var(--s2);
+  margin-bottom: var(--s1);
+  background: var(--slot-bg);
+  border-left: 4px solid var(--divider);
+  font-size: var(--t-sm);
+  color: var(--ink);
+}
+
+.dbg-check i {
+  font-size: 18px;
+  line-height: 1.2;
+}
+
+.dbg-check-title {
+  font-weight: bold;
+}
+
+.dbg-check-detail {
+  font-size: var(--t-xs);
+  color: var(--ink-meta);
+  line-height: 1.5;
+}
+
+.dbg-check.lvl-error { border-left-color: var(--mc-red); }
+.dbg-check.lvl-error i { color: var(--err-ink); }
+.dbg-check.lvl-warn  { border-left-color: var(--mc-yellow); }
+.dbg-check.lvl-warn i { color: var(--warn-ink); }
+.dbg-check.lvl-info  { border-left-color: var(--mc-cyan); }
+.dbg-check.lvl-info i { color: var(--ink-meta); }
+.dbg-check.lvl-ok    { border-left-color: var(--mc-green); }
+.dbg-check.lvl-ok i  { color: var(--ok-ink); }
+
+.dbg-pill {
+  flex: none;
+  font-size: var(--t-xs);
+  padding: 1px var(--s2);
+  border: 2px solid var(--btn-dark);
+  background: var(--btn-face);
+  color: var(--btn-ink);
+}
+
+.dbg-pill.ok   { color: #1a5c1a; background: #9ad79a; }
+.dbg-pill.warn { color: #644f00; background: #e6d78a; }
+.dbg-pill.off  { color: var(--ink-faint); }
+
+.log-box {
+  background: #000;
+  border: 3px solid var(--btn-dark);
+  padding: var(--s2);
+  height: clamp(220px, 40vh, 480px);
+  overflow: auto;
+  font-family: monospace;
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--mc-green);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.log-box.sm {
+  height: clamp(110px, 16vh, 200px);
+  font-size: 11px;
+}
+
+.dbg-usage {
+  margin-bottom: var(--s2);
+}
+
+.dbg-usage-lbl {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--s2);
+  font-size: var(--t-xs);
+  color: var(--ink-meta);
+  margin-bottom: 2px;
+}
+
+.mc-select.sm {
+  width: auto;
+  font-size: 13px;
+  padding: 2px var(--s1);
+}
+
+/* ----- File manager / debug on narrow screens --------------------------- */
+@media (max-width: 880px) {
+  .fm-row {
+    grid-template-columns: 24px minmax(0, 1fr) 80px 176px;
+  }
+
+  .fm-c-time,
+  .fm-c-mode {
+    display: none;
+  }
+
+  .kv-grid {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 0 0;
+  }
+
+  .kv-k {
+    border-bottom: none;
+    padding-top: var(--s1);
+  }
+}
+
+@media (max-width: 560px) {
+  .fm-row {
+    grid-template-columns: 24px minmax(0, 1fr);
+  }
+
+  .fm-c-size {
+    display: none;
+  }
+
+  .fm-c-act {
+    grid-column: 1 / -1;
+    justify-content: flex-start;
+  }
+
+  .fm-head .fm-c-act {
+    display: none;
   }
 }

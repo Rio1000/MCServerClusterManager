@@ -12,8 +12,13 @@ let currentPlayerTarget = "";
 // Single source of truth for all panels (drives sw() deactivation)
 const PANELS = [
   'instances', 'overview', 'console', 'players',
-  'properties', 'world', 'upload', 'mods', 'automation'
+  'properties', 'world', 'files', 'upload', 'mods', 'debug', 'automation'
 ];
+
+// Everything except Instances needs a target, and the sidebar hides those
+// entries until one is picked. sw() still checks, so a stale deep link or a
+// server deleted out from under the user cannot land on an empty panel.
+const TARGET_PANELS = new Set(PANELS.filter(p => p !== 'instances'));
 
 const WORLD_KEYS = [
   'level-name', 'level-seed', 'level-type', 'allow-nether', 'max-build-height',
@@ -67,7 +72,7 @@ const PROP_GROUPS = [
 ];
 
 // Panels that auto-refresh on inactive servers – poll less aggressively
-const PASSIVE_PANELS = new Set(['properties', 'world', 'upload', 'mods', 'automation']);
+const PASSIVE_PANELS = new Set(['properties', 'world', 'files', 'upload', 'mods', 'debug', 'automation']);
 
 // ---------------------------------------------------------------------------
 // Theme (day / night)
@@ -165,6 +170,7 @@ document.addEventListener('DOMContentLoaded', () => {
   renderRconCommands();
   renderModalTabs();
   initTheme();
+  applyTargetGate();
 });
 
 // ---------------------------------------------------------------------------
@@ -316,6 +322,12 @@ function sendTerminalCommand() {
 // Panel switcher — includes scroll-to-top on every switch
 // ---------------------------------------------------------------------------
 function sw(id, el) {
+  if (TARGET_PANELS.has(id) && !activeServer) {
+    toast('Select a server instance first.', 'error');
+    id = 'instances';
+    el = document.querySelector('.sb-item[data-panel=instances]');
+  }
+
   PANELS.forEach(p => {
     const pEl = document.getElementById('panel-' + p);
     if (pEl) pEl.classList.remove('active');
@@ -334,6 +346,30 @@ function sw(id, el) {
   if (id === 'automation') { loadBackups(); loadJobs(); }
   if (id === 'mods') { loadInstalledAddons(); refreshPackwizStatus(); }
   if (id === 'players') { requestPlayerList(); }
+  if (id === 'files') { fmReload(); }
+  // The debug snapshot shells out to docker several times, so it is fetched
+  // once per target and then only on request.
+  if (id === 'debug' && !debugData) { loadDebug(); loadDebugLogs(); }
+}
+
+// ---------------------------------------------------------------------------
+// Target gate — with nothing selected the only thing on offer is Instances
+// ---------------------------------------------------------------------------
+function applyTargetGate() {
+  document.body.classList.toggle('no-target', !activeServer);
+}
+
+function clearTarget() {
+  activeServer = null;
+  isStartingLocal = false;
+  if (playerPollTimer) { clearInterval(playerPollTimer); playerPollTimer = null; }
+  document.getElementById('active-target').textContent = 'None';
+  document.getElementById('stat-node').textContent = 'N/A';
+  const pill = document.getElementById('status-pill');
+  pill.textContent = 'NO SERVER SELECTED';
+  pill.className = 'pill pill-off';
+  applyTargetGate();
+  sw('instances', document.querySelector('.sb-item[data-panel=instances]'));
 }
 
 // ---------------------------------------------------------------------------
@@ -407,9 +443,12 @@ function setServerTarget(name, status) {
   document.getElementById('active-target').textContent = name;
   document.getElementById('stat-node').textContent = name;
   updateServerStatusUI(status);
+  applyTargetGate();
   logTerm(`Switched target to: ${name}`);
   loadPropsFromServer();
   loadInstalledAddons();
+  fmResetForServer();
+  debugResetForServer();
 
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({ method: 'docker:logs/subscribe', target: name }));
@@ -482,6 +521,8 @@ async function fetchNodes() {
       </div>
       <div class="btn-row">
         <button class="mc-btn" onclick="setServerTarget('${escapeHtml(s.name)}','${escapeHtml(s.status)}');sw('overview',document.querySelector('[data-panel=overview]'))">SELECT</button>
+        <button class="mc-btn" onclick="openDuplicate('${escapeHtml(s.name)}')">DUPLICATE</button>
+        <button class="mc-btn" onclick="openUpdate('${escapeHtml(s.name)}')">UPDATE</button>
         <button class="mc-btn red" onclick="deleteServer('${escapeHtml(s.name)}')">DELETE</button>
       </div>
     </div>`;
@@ -515,11 +556,14 @@ async function createServer() {
 
   if (!name) { toast('Container ID is required.', 'error'); return; }
 
-  // Client-side port conflict check
+  // Only the Java port is pre-checked here. Voice chat and Bedrock ports are
+  // deliberately left to the server, which shifts them to the next free number
+  // instead of refusing the deploy — see AUX_PORTS in web_manager.py.
   const listRes = await fetch('/api/servers').catch(() => null);
   if (listRes && listRes.ok) {
     const listData = await listRes.json().catch(() => ({}));
-    const conflict = (listData.servers || []).find(s => s.ports && s.ports.includes(`:${port}->`));
+    const conflict = (listData.servers || []).find(
+      s => s.ports && s.ports.includes(`:${port}->`) && s.ports.includes(`:${port}->25565/tcp`));
     if (conflict) {
       toast(`Port ${port} is already used by '${conflict.name}'.`, 'error');
       return;
@@ -545,9 +589,220 @@ async function createServer() {
     toast(data.detail || data.error || 'Deploy failed.', 'error');
   } else {
     toast(data.message || `Server '${name}' deployed!`, 'ok');
+    (data.moved_ports || []).forEach(m =>
+      toast(`${m.service}: ${m.from} was busy, using ${m.to}.`, 'ok'));
     fetchNodes();
     sw('instances', document.querySelector('[data-panel=instances]'));
   }
+}
+
+// ---------------------------------------------------------------------------
+// Duplicate server — same build, new port, fresh world
+// ---------------------------------------------------------------------------
+function openDuplicate(name) {
+  document.getElementById('dup-source').textContent = name;
+  document.getElementById('dup-name').value = `${name}-copy`;
+  document.getElementById('dup-port').value = '';
+  document.getElementById('dup-world').value = 'world';
+  document.getElementById('dup-seed').value = '';
+  document.getElementById('dup-modal').classList.add('active');
+}
+
+function closeDuplicate() {
+  document.getElementById('dup-modal').classList.remove('active');
+}
+
+async function runDuplicate() {
+  const source   = document.getElementById('dup-source').textContent;
+  const newName  = document.getElementById('dup-name').value.trim();
+  const port     = document.getElementById('dup-port').value.trim();
+  const world    = document.getElementById('dup-world').value.trim() || 'world';
+  const seed     = document.getElementById('dup-seed').value.trim();
+
+  if (!newName) { toast('The copy needs a name.', 'error'); return; }
+  if (!port)    { toast('The copy needs a port.', 'error'); return; }
+
+  const btn = document.getElementById('btn-dup-go');
+  btn.disabled = true;
+  btn.textContent = 'Cloning...';
+
+  const res = await fetch(`/api/server/${encodeURIComponent(source)}/duplicate`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ new_name: newName, port, level_name: world, seed }),
+  }).catch(() => null);
+
+  btn.disabled = false;
+  btn.textContent = 'Clone Node';
+
+  if (!res) { toast('Network error during clone.', 'error'); return; }
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || data.error) {
+    toast(data.detail || data.error || 'Clone failed.', 'error');
+    return;
+  }
+  closeDuplicate();
+  toast(data.message || `'${newName}' cloned.`, 'ok');
+  (data.moved_ports || []).forEach(m =>
+    toast(`${m.service}: ${m.from} was busy, using ${m.to}.`, 'ok'));
+  fetchNodes();
+}
+
+// ---------------------------------------------------------------------------
+// Update server — version / mods / world, via mc-update.py and packwiz
+// ---------------------------------------------------------------------------
+let updateTarget = null;
+let updatePoll = null;
+
+async function openUpdate(name) {
+  updateTarget = name;
+  document.getElementById('upd-source').textContent = name;
+  document.getElementById('upd-report').innerHTML = '';
+  document.getElementById('upd-log').textContent = '';
+  document.getElementById('upd-modal').classList.add('active');
+
+  const box = document.getElementById('upd-scopes');
+  box.innerHTML = '<div class="empty">Checking what this server supports…</div>';
+
+  const res = await fetch(`/api/server/${encodeURIComponent(name)}/update/options`)
+    .catch(() => null);
+  if (!res || !res.ok) {
+    // A 404 here almost always means the page is newer than the running
+    // service: static files are read from disk per request, routes only load
+    // at startup.
+    const detail = !res ? 'network error'
+      : res.status === 404 ? 'HTTP 404 — the manager service is running older code; restart it'
+      : `HTTP ${res.status} — ${(await res.json().catch(() => ({}))).detail || res.statusText}`;
+    box.innerHTML = `<div class="empty">Could not read update options (${escapeHtml(detail)}).</div>`;
+    return;
+  }
+  const opt = await res.json();
+  document.getElementById('upd-current').textContent = opt.current_version || '?';
+
+  const labels = {
+    version: ['Server version', 'Resolves a target version, verifies every mod against it, takes a borg backup, then recreates the container.'],
+    mods:    ['Mods', 'Runs packwiz update across the pack, pulling the newest build of each mod for the current version.'],
+    world:   ['World / chunks (plan only)', 'Runs mc-chunkdiff.py plan — reads the seed, datapacks and version out of the live world and prints the recipe for building a reference. Read-only. Deleting untouched chunks is a separate, deliberate step on the command line.'],
+  };
+
+  box.innerHTML = Object.entries(opt.scopes).map(([key, s]) => {
+    const [title, desc] = labels[key] || [key, ''];
+    const dis = s.available ? '' : 'disabled';
+    return `
+      <label class="check-row upd-scope ${s.available ? '' : 'is-disabled'}">
+        <input type="radio" name="upd-scope" value="${key}" ${dis}>
+        <span>
+          <strong>${escapeHtml(title)}</strong>
+          <span class="card-hint" style="display:block;">${escapeHtml(desc)}</span>
+          ${s.available ? '' :
+            `<span class="card-hint" style="display:block;color:var(--warn,#c90);">
+               Unavailable — ${escapeHtml(s.reason)}</span>`}
+        </span>
+      </label>`;
+  }).join('');
+
+  const first = box.querySelector('input[name=upd-scope]:not([disabled])');
+  if (first) first.checked = true;
+  pollUpdateStatus(true);
+}
+
+function closeUpdate() {
+  document.getElementById('upd-modal').classList.remove('active');
+  if (updatePoll) { clearInterval(updatePoll); updatePoll = null; }
+}
+
+function selectedScope() {
+  const el = document.querySelector('input[name=upd-scope]:checked');
+  return el ? el.value : null;
+}
+
+async function runUpdateCheck() {
+  if (!updateTarget) return;
+  const target = document.getElementById('upd-target').value.trim();
+  const report = document.getElementById('upd-report');
+  report.innerHTML = '<div class="empty">Resolving mods against the target version…</div>';
+
+  const res = await fetch(`/api/server/${encodeURIComponent(updateTarget)}/update/check`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ target }),
+  }).catch(() => null);
+
+  if (!res) { report.innerHTML = '<div class="empty">Network error.</div>'; return; }
+  const d = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    report.innerHTML = `<div class="empty">${escapeHtml(d.detail || 'Check failed.')}</div>`;
+    return;
+  }
+
+  const blockers = d.blockers || [];
+  const verdict = d.up_to_date
+    ? `Already on ${escapeHtml(d.current)} — nothing to do.`
+    : d.can_update
+      ? `${escapeHtml(d.current)} → ${escapeHtml(d.target)}: all ${(d.mods || []).length} mods resolve.`
+      : `${escapeHtml(d.current)} → ${escapeHtml(d.target)} is blocked by ${blockers.length} mod(s).`;
+
+  report.innerHTML = `
+    <div class="srv-meta" style="margin-bottom:6px;">${verdict}</div>
+    ${blockers.length ? `<ul class="upd-blockers">${
+      blockers.map(b => `<li>${escapeHtml(b)}</li>`).join('')}</ul>` : ''}
+    ${(d.loose_jars || []).length ? `<div class="card-hint">Loose jars packwiz cannot
+       track: ${escapeHtml((d.loose_jars || []).join(', '))}</div>` : ''}`;
+}
+
+async function runUpdateApply() {
+  if (!updateTarget) return;
+  const scope = selectedScope();
+  if (!scope) { toast('Pick what to update.', 'error'); return; }
+
+  const body = { scope, target: document.getElementById('upd-target').value.trim() };
+  if (scope === 'world') body.dimension = document.getElementById('upd-dimension').value;
+
+  if (scope === 'version' &&
+      !confirm(`Update the server version for '${updateTarget}'?\n\n` +
+               `This takes a backup, recreates the container and watches the boot. ` +
+               `It can take several minutes.`)) return;
+
+  const btn = document.getElementById('btn-upd-go');
+  btn.disabled = true; btn.textContent = 'Starting…';
+
+  const res = await fetch(`/api/server/${encodeURIComponent(updateTarget)}/update/apply`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  }).catch(() => null);
+
+  btn.disabled = false; btn.textContent = 'Run Update';
+
+  const d = res ? await res.json().catch(() => ({})) : {};
+  if (!res || !res.ok) { toast(d.detail || 'Could not start the update.', 'error'); return; }
+  toast(d.message || 'Update started.', 'ok');
+  pollUpdateStatus();
+}
+
+async function pollUpdateStatus(once) {
+  if (updatePoll) { clearInterval(updatePoll); updatePoll = null; }
+
+  const tick = async () => {
+    if (!updateTarget) return;
+    const res = await fetch(`/api/server/${encodeURIComponent(updateTarget)}/update/status`)
+      .catch(() => null);
+    if (!res || !res.ok) return;
+    const d = await res.json().catch(() => ({}));
+    const log = document.getElementById('upd-log');
+    const badge = document.getElementById('upd-state');
+
+    if (d.state === 'idle') { badge.textContent = ''; return; }
+    badge.textContent = `${d.scope || ''} — ${d.state}`;
+    if (d.output) log.textContent = d.output;
+
+    if (d.state !== 'running') {
+      if (updatePoll) { clearInterval(updatePoll); updatePoll = null; }
+      toast(d.state === 'done' ? 'Update finished.' : 'Update failed — see the log.',
+            d.state === 'done' ? 'ok' : 'error');
+      fetchNodes();
+    }
+  };
+
+  await tick();
+  if (!once) updatePoll = setInterval(tick, 3000);
 }
 
 // ---------------------------------------------------------------------------
@@ -561,11 +816,7 @@ async function deleteServer(name) {
   }).catch(() => null);
 
   if (!res || !res.ok) { toast('Delete failed.', 'error'); return; }
-  if (activeServer === name) {
-    activeServer = null;
-    document.getElementById('active-target').textContent = 'None';
-    updateServerStatusUI('offline');
-  }
+  if (activeServer === name) clearTarget();
   toast(`'${name}' removed.`, 'ok');
   fetchNodes();
 }
@@ -1098,4 +1349,616 @@ async function deleteJob(jobId) {
   if (!res || !res.ok) { toast('Failed to remove task.', 'error'); return; }
   toast('Task removed.', 'ok');
   loadJobs();
+}
+
+// ---------------------------------------------------------------------------
+// Shared fetch helper for the file manager and debug panels
+// ---------------------------------------------------------------------------
+async function apiCall(url, opts = {}) {
+  const res = await fetch(url, opts).catch(() => null);
+  if (!res) { toast('Cannot reach the daemon API.', 'error'); return null; }
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    toast(data.detail || data.message || `Request failed (${res.status}).`, 'error');
+    return null;
+  }
+  return data;
+}
+
+function fmtTime(epoch) {
+  if (!epoch) return '—';
+  return new Date(epoch * 1000).toLocaleString();
+}
+
+// ---------------------------------------------------------------------------
+// File manager
+//
+// Rows carry their path in data attributes and the list delegates clicks, so a
+// filename containing a quote or a backslash cannot break out of a handler the
+// way it would with an interpolated onclick.
+// ---------------------------------------------------------------------------
+let fmPath = '';
+let fmEntries = [];
+let fmSelected = new Set();
+let fmEditing = null;     // { path, mtime } of the file open in the editor
+let fmDirty = false;
+
+function fmJoin(dir, name) { return dir ? `${dir}/${name}` : name; }
+function fmParent(path) {
+  const i = path.lastIndexOf('/');
+  return i === -1 ? '' : path.slice(0, i);
+}
+function fmStatus(msg, cls = '') {
+  const el = document.getElementById('fm-status');
+  if (el) el.innerHTML = cls ? `<span class="${cls}">${escapeHtml(msg)}</span>` : escapeHtml(msg);
+}
+
+function fmResetForServer() {
+  fmPath = '';
+  fmEntries = [];
+  fmSelected.clear();
+  // Switching target drops the editor without asking: the buffer belongs to a
+  // server that is no longer the one on screen, so there is nowhere to save it.
+  fmForceCloseEditor();
+  const list = document.getElementById('fm-list');
+  if (list) list.innerHTML = '<div class="empty">Loading…</div>';
+  if (document.getElementById('panel-files').classList.contains('active')) fmReload();
+}
+
+function fmReload() { fmNavigate(fmPath); }
+
+async function fmNavigate(path) {
+  if (!activeServer) { toast('Select a server first.', 'error'); return; }
+  const data = await apiCall(
+    `/api/server/${activeServer}/files/list?path=${encodeURIComponent(path || '')}`);
+  if (!data) {
+    // A deleted folder should not strand the browser on a dead path.
+    if (path) fmNavigate(fmParent(path));
+    return;
+  }
+  fmPath = data.path || '';
+  fmEntries = data.entries || [];
+  fmSelected.clear();
+  document.getElementById('fm-up-btn').disabled = !fmPath;
+  fmRenderCrumbs();
+  fmRenderList();
+  fmStatus(`${fmEntries.length} item(s) in ${activeServer}/${fmPath || ''} — drop files on the list to upload here.`);
+}
+
+function fmUp() { if (fmPath) fmNavigate(fmParent(fmPath)); }
+
+function fmRenderCrumbs() {
+  const el = document.getElementById('fm-crumbs');
+  const parts = fmPath ? fmPath.split('/') : [];
+  let acc = '';
+  const crumbs = [`<button class="fm-crumb" data-nav="">${escapeHtml(activeServer || '/')}</button>`];
+  parts.forEach(p => {
+    acc = fmJoin(acc, p);
+    crumbs.push(`<span class="fm-crumb-sep">/</span>` +
+      `<button class="fm-crumb" data-nav="${escapeHtml(acc)}">${escapeHtml(p)}</button>`);
+  });
+  el.innerHTML = crumbs.join('');
+}
+
+function fmRenderList() {
+  const el = document.getElementById('fm-list');
+  const term = (document.getElementById('fm-filter').value || '').toLowerCase();
+  const rows = fmEntries.filter(e => !term || e.name.toLowerCase().includes(term));
+
+  if (!rows.length) {
+    el.innerHTML = `<div class="empty">${fmEntries.length ? 'Nothing matches that filter.' : 'This folder is empty.'}</div>`;
+    fmSyncSelectionUI();
+    return;
+  }
+
+  el.innerHTML = rows.map(e => {
+    const icon = e.dir ? 'ti-folder' : (e.text ? 'ti-file-text' : 'ti-file');
+    const link = e.link ? `<span class="fm-flag">${e.broken ? 'broken link' : 'link'}</span>` : '';
+    const acts = [
+      e.dir ? '' : `<button class="mc-btn sm" data-act="download">GET</button>`,
+      (!e.dir && e.text) ? `<button class="mc-btn sm" data-act="edit">EDIT</button>` : '',
+      `<button class="mc-btn sm" data-act="rename">REN</button>`,
+      `<button class="mc-btn sm red" data-act="delete">DEL</button>`,
+    ].join('');
+    return `
+      <div class="fm-row" data-path="${escapeHtml(e.path)}" data-dir="${e.dir ? '1' : '0'}">
+        <span class="fm-c-check">
+          <input type="checkbox" data-act="select" ${fmSelected.has(e.path) ? 'checked' : ''}>
+        </span>
+        <span class="fm-c-name">
+          <button class="fm-name" data-act="open"><i class="ti ${icon}"></i>${escapeHtml(e.name)}</button>${link}
+        </span>
+        <span class="fm-c-size">${e.dir ? '—' : escapeHtml(e.human)}</span>
+        <span class="fm-c-time">${escapeHtml(fmtTime(e.mtime))}</span>
+        <span class="fm-c-mode mono">${escapeHtml(e.mode)}</span>
+        <span class="fm-c-act">${acts}</span>
+      </div>`;
+  }).join('');
+  fmSyncSelectionUI();
+}
+
+function fmSyncSelectionUI() {
+  const del = document.getElementById('fm-del-btn');
+  if (del) {
+    del.disabled = fmSelected.size === 0;
+    del.textContent = fmSelected.size ? `DELETE (${fmSelected.size})` : 'DELETE';
+  }
+  const all = document.getElementById('fm-check-all');
+  if (all) all.checked = fmEntries.length > 0 && fmSelected.size === fmEntries.length;
+}
+
+function fmToggleAll(on) {
+  fmSelected.clear();
+  if (on) fmEntries.forEach(e => fmSelected.add(e.path));
+  fmRenderList();
+}
+
+function fmEntryFor(path) { return fmEntries.find(e => e.path === path); }
+
+document.addEventListener('DOMContentLoaded', () => {
+  const list = document.getElementById('fm-list');
+  if (list) {
+    list.addEventListener('click', ev => {
+      const hit = ev.target.closest('[data-act]');
+      if (!hit) return;
+      const row = hit.closest('.fm-row');
+      if (!row) return;
+      const path = row.dataset.path;
+      const isDir = row.dataset.dir === '1';
+      switch (hit.dataset.act) {
+        case 'select':
+          if (hit.checked) fmSelected.add(path); else fmSelected.delete(path);
+          fmSyncSelectionUI();
+          break;
+        case 'open':
+          if (isDir) fmNavigate(path);
+          else if (fmEntryFor(path)?.text) fmEdit(path);
+          else fmDownload(path);
+          break;
+        case 'edit':     fmEdit(path); break;
+        case 'download': fmDownload(path); break;
+        case 'rename':   fmRename(path); break;
+        case 'delete':   fmDelete([path]); break;
+      }
+    });
+  }
+  const crumbs = document.getElementById('fm-crumbs');
+  if (crumbs) {
+    crumbs.addEventListener('click', ev => {
+      const hit = ev.target.closest('[data-nav]');
+      if (hit) fmNavigate(hit.dataset.nav);
+    });
+  }
+});
+
+function fmDownload(path) {
+  window.location.href =
+    `/api/server/${activeServer}/files/download?path=${encodeURIComponent(path)}`;
+}
+
+async function fmRename(path) {
+  const entry = fmEntryFor(path);
+  const current = entry ? entry.name : path.split('/').pop();
+  const next = prompt(`Rename '${current}' to (a path with / moves it):`, current);
+  if (next === null) return;
+  const clean = next.trim();
+  if (!clean || clean === current) return;
+  // A bare name stays put; anything with a slash is treated as a path from the
+  // volume root, which is how a move is expressed.
+  const to = clean.includes('/') ? clean.replace(/^\/+/, '') : fmJoin(fmParent(path), clean);
+  const data = await apiCall(`/api/server/${activeServer}/files/rename`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ path, to }),
+  });
+  if (!data) return;
+  toast(data.message, 'ok');
+  if (fmEditing && fmEditing.path === path) fmCloseEditor();
+  fmReload();
+}
+
+function fmDeleteSelected() { fmDelete([...fmSelected]); }
+
+async function fmDelete(paths) {
+  if (!paths.length) return;
+  const label = paths.length === 1 ? `'${paths[0]}'` : `${paths.length} items`;
+  if (!confirm(`Permanently delete ${label} from '${activeServer}'? This cannot be undone.`)) return;
+  const data = await apiCall(`/api/server/${activeServer}/files/delete`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ paths }),
+  });
+  if (!data) return;
+  toast(data.message, data.failed && data.failed.length ? 'error' : 'ok');
+  if (fmEditing && paths.includes(fmEditing.path)) fmCloseEditor();
+  fmReload();
+}
+
+async function fmNewFolder() {
+  if (!activeServer) { toast('Select a server first.', 'error'); return; }
+  const name = prompt('New folder name:');
+  if (!name || !name.trim()) return;
+  const data = await apiCall(`/api/server/${activeServer}/files/mkdir`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ path: fmJoin(fmPath, name.trim()) }),
+  });
+  if (data) { toast(data.message, 'ok'); fmReload(); }
+}
+
+async function fmNewFile() {
+  if (!activeServer) { toast('Select a server first.', 'error'); return; }
+  const name = prompt('New file name:');
+  if (!name || !name.trim()) return;
+  const path = fmJoin(fmPath, name.trim());
+  const data = await apiCall(`/api/server/${activeServer}/files/write`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ path, content: '' }),
+  });
+  if (!data) return;
+  toast(`Created ${path}.`, 'ok');
+  await fmNavigate(fmPath);
+  fmEdit(path);
+}
+
+// ---- Upload ---------------------------------------------------------------
+function fmUploadInput(ev) {
+  const files = ev.target.files;
+  if (files && files.length) fmUpload(files);
+  ev.target.value = '';
+}
+
+function fmHandleDrop(ev) {
+  ev.preventDefault();
+  document.getElementById('fm-drop').classList.remove('drag');
+  const files = ev.dataTransfer && ev.dataTransfer.files;
+  if (files && files.length) fmUpload(files);
+}
+
+async function fmUpload(fileList) {
+  if (!activeServer) { toast('Select a server first.', 'error'); return; }
+  const form = new FormData();
+  form.append('path', fmPath);
+  [...fileList].forEach(f => form.append('files', f, f.name));
+  fmStatus(`Uploading ${fileList.length} file(s) to ${fmPath || '/'}…`);
+  const data = await apiCall(`/api/server/${activeServer}/files/upload`,
+    { method: 'POST', body: form });
+  if (!data) { fmStatus('Upload failed.', 'err'); return; }
+  toast(data.message, 'ok');
+  fmReload();
+}
+
+// ---- Inline editor --------------------------------------------------------
+async function fmEdit(path) {
+  if (fmDirty && !confirm('Discard unsaved changes to the open file?')) return;
+  const data = await apiCall(
+    `/api/server/${activeServer}/files/read?path=${encodeURIComponent(path)}`);
+  if (!data) return;
+  fmEditing = { path: data.path, mtime: data.mtime };
+  fmDirty = false;
+  document.getElementById('fm-edit-path').textContent = data.path;
+  document.getElementById('fm-editor').value = data.content;
+  document.getElementById('fm-editor-card').hidden = false;
+  const hint = document.getElementById('fm-edit-hint');
+  hint.className = 'save-hint';
+  hint.textContent = `${data.size} bytes — last modified ${fmtTime(data.mtime)}`;
+  document.getElementById('fm-editor-card').scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
+function fmMarkDirty() {
+  if (!fmEditing || fmDirty) return;
+  fmDirty = true;
+  const hint = document.getElementById('fm-edit-hint');
+  hint.className = 'save-hint dirty';
+  hint.textContent = 'Unsaved changes';
+}
+
+function fmForceCloseEditor() {
+  fmEditing = null;
+  fmDirty = false;
+  const card = document.getElementById('fm-editor-card');
+  if (!card) return;
+  card.hidden = true;
+  document.getElementById('fm-editor').value = '';
+}
+
+function fmCloseEditor() {
+  if (fmDirty && !confirm('Discard unsaved changes?')) return;
+  fmForceCloseEditor();
+}
+
+async function fmSaveEditor() {
+  if (!fmEditing) return;
+  const content = document.getElementById('fm-editor').value;
+  const data = await apiCall(`/api/server/${activeServer}/files/write`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ path: fmEditing.path, content }),
+  });
+  if (!data) return;
+  fmDirty = false;
+  fmEditing.mtime = data.mtime;
+  const hint = document.getElementById('fm-edit-hint');
+  hint.className = 'save-hint saved';
+  hint.textContent = `Saved at ${fmtTime(data.mtime)}`;
+  toast(data.message, 'ok');
+  // server.properties is mirrored in two other panels — keep them honest.
+  if (fmEditing.path === 'server.properties') loadPropsFromServer();
+  fmNavigate(fmPath);
+}
+
+// ---------------------------------------------------------------------------
+// Debug panel
+// ---------------------------------------------------------------------------
+let debugData = null;
+let debugLogs = null;
+let debugDisk = null;
+let debugAutoTimer = null;
+let debugProblemsOnly = false;
+
+const DBG_LEVEL_ICON = { error: 'ti-alert-triangle', warn: 'ti-alert-circle', info: 'ti-info-circle', ok: 'ti-circle-check' };
+
+function debugResetForServer() {
+  debugData = null; debugLogs = null; debugDisk = null;
+  const disk = document.getElementById('dbg-disk');
+  if (disk) disk.innerHTML =
+    '<div class="empty">Not measured — walking a large world takes a while, so it is on demand.</div>';
+  if (document.getElementById('panel-debug').classList.contains('active')) {
+    loadDebug(); loadDebugLogs();
+  }
+}
+
+function renderKV(id, pairs) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  const rows = pairs.filter(([, v]) => v !== undefined && v !== null && v !== '');
+  el.innerHTML = rows.length
+    ? rows.map(([k, v, cls]) =>
+      `<div class="kv-k">${escapeHtml(k)}</div>` +
+      `<div class="kv-v ${cls || ''}">${escapeHtml(String(v))}</div>`).join('')
+    : '<div class="empty">Nothing reported.</div>';
+}
+
+async function loadDebug() {
+  if (!activeServer) { toast('Select a server first.', 'error'); return; }
+  const data = await apiCall(`/api/server/${activeServer}/debug`);
+  if (!data) return;
+  debugData = data;
+  document.getElementById('dbg-generated').textContent = `snapshot ${data.generated}`;
+
+  // ---- Diagnosis ----------------------------------------------------------
+  document.getElementById('dbg-checks').innerHTML = (data.checks || []).map(c => `
+    <div class="dbg-check lvl-${escapeHtml(c.level)}">
+      <i class="ti ${DBG_LEVEL_ICON[c.level] || 'ti-info-circle'}"></i>
+      <div>
+        <div class="dbg-check-title">${escapeHtml(c.title)}</div>
+        <div class="dbg-check-detail">${escapeHtml(c.detail)}</div>
+      </div>
+    </div>`).join('') || '<div class="empty">No findings.</div>';
+
+  // ---- Container ----------------------------------------------------------
+  const c = data.container || {};
+  const stateCls = c.running ? 'ok' : (c.exists ? 'err' : 'err');
+  renderKV('dbg-container', [
+    ['State', c.exists ? c.status : 'no such container', stateCls],
+    ['Container ID', c.id],
+    ['Image', c.image],
+    ['Exit code', c.exists && !c.running ? c.exit_code : ''],
+    ['Docker error', c.error, 'err'],
+    ['OOM killed', c.oom_killed ? 'yes' : ''],
+    ['Restarts', c.restart_count],
+    ['Restart policy', c.restart_policy],
+    ['PID', c.pid || ''],
+    ['Created', c.created],
+    ['Started', c.started_at],
+    ['Finished', c.running ? '' : c.finished_at],
+    ['Memory limit', c.memory_limit],
+    ['CPU limit', c.cpu_limit],
+    ['Compose service', c.compose_service],
+    ['Health', (c.health || {}).status],
+    ['Health failures', (c.health || {}).failing_streak || ''],
+    ...((c.health || {}).log || []).map((h, i) => [`Health probe ${i + 1}`, `exit ${h.exit}: ${h.output}`]),
+  ]);
+
+  // ---- Ports --------------------------------------------------------------
+  const ports = data.ports || [];
+  document.getElementById('dbg-ports').innerHTML = ports.length ? ports.map(p => `
+    <div class="list-row">
+      <div class="row-main mono">${escapeHtml(p.ip)}:${escapeHtml(p.host || '—')} → ${escapeHtml(p.container)}/${escapeHtml(p.proto)}</div>
+      <span class="dbg-pill ${p.published ? (p.listening ? 'ok' : 'warn') : 'off'}">
+        ${p.published ? (p.listening ? 'LISTENING' : 'NO ANSWER') : 'UNPUBLISHED'}</span>
+    </div>`).join('') : '<div class="empty">No ports mapped.</div>';
+
+  // ---- Stats / processes --------------------------------------------------
+  const s = data.stats || {};
+  renderKV('dbg-stats', [
+    ['CPU', s.cpu], ['Memory', s.mem], ['Memory %', s.mem_perc],
+    ['Network I/O', s.net_io], ['Block I/O', s.block_io], ['Threads', s.pids],
+  ]);
+  if (!Object.keys(s).length) {
+    document.getElementById('dbg-stats').innerHTML =
+      '<div class="empty">Container is not running.</div>';
+  }
+  document.getElementById('dbg-top').textContent = data.top || '—';
+
+  // ---- Environment / properties ------------------------------------------
+  renderKV('dbg-env', Object.entries(data.env || {}));
+  renderKV('dbg-props', Object.entries(data.properties || {}));
+
+  // ---- Files --------------------------------------------------------------
+  document.getElementById('dbg-files').innerHTML = (data.files || []).map(f => `
+    <div class="list-row">
+      <div class="row-main mono">${escapeHtml(f.path)}</div>
+      <div class="row-sub">${f.exists ? `${escapeHtml(f.human || '')} · ${escapeHtml(fmtTime(f.mtime))}` : 'missing'}</div>
+      <span class="dbg-pill ${f.exists ? 'ok' : 'off'}">${f.exists ? 'PRESENT' : 'ABSENT'}</span>
+    </div>`).join('') || '<div class="empty">Volume not readable.</div>';
+
+  document.getElementById('dbg-crash').innerHTML = (data.crash_reports || []).map(f => `
+    <div class="list-row">
+      <div class="row-main mono">${escapeHtml(f.name)}</div>
+      <div class="row-sub">${escapeHtml(f.human)} · ${escapeHtml(fmtTime(f.mtime))}</div>
+      <button class="mc-btn sm" data-dbgfile="crash-reports/${escapeHtml(f.name)}">VIEW</button>
+    </div>`).join('') || '<div class="empty">No crash reports — good sign.</div>';
+
+  document.getElementById('dbg-logfiles').innerHTML = (data.log_files || []).map(f => `
+    <div class="list-row">
+      <div class="row-main mono">${escapeHtml(f.name)}</div>
+      <div class="row-sub">${escapeHtml(f.human)} · ${escapeHtml(fmtTime(f.mtime))}</div>
+      <button class="mc-btn sm" data-dbgfile="logs/${escapeHtml(f.name)}">VIEW</button>
+    </div>`).join('') || '<div class="empty">No log files on the volume yet.</div>';
+
+  // ---- Host ---------------------------------------------------------------
+  const h = data.host || {};
+  const d = h.disk || {};
+  renderKV('dbg-host', [
+    ['Docker', h.docker_version],
+    ['Image', `${h.image}${h.image_present ? '' : ' (NOT PULLED)'}`, h.image_present ? '' : 'err'],
+    ['Volume', h.volume, h.volume_exists ? '' : 'err'],
+    ['Volume exists', h.volume_exists ? 'yes' : 'no', h.volume_exists ? 'ok' : 'err'],
+    ['Data dir', h.data_dir],
+    ['Host CPU', h.cpu !== undefined ? `${h.cpu}%` : ''],
+    ['Host RAM', h.ram !== undefined ? `${h.ram}%` : ''],
+    ['Load avg', (h.load || []).join('  ')],
+    ['Disk', d.total ? `${d.used} used / ${d.total} (${d.percent}%) — ${d.free} free` : ''],
+    ['packwiz', h.packwiz || 'not installed'],
+    ['Manager Python', h.python],
+  ]);
+
+  document.getElementById('dbg-audit').innerHTML = (data.audit || []).map(l =>
+    `<div class="list-row"><div class="row-main mono">${escapeHtml(l)}</div></div>`
+  ).join('') || '<div class="empty">Nothing logged for this instance yet.</div>';
+}
+
+// A crash report is just a file on the volume — hand it to the file manager
+// rather than building a second viewer.
+document.addEventListener('DOMContentLoaded', () => {
+  ['dbg-crash', 'dbg-logfiles'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.addEventListener('click', ev => {
+      const hit = ev.target.closest('[data-dbgfile]');
+      if (hit) debugOpenFile(hit.dataset.dbgfile);
+    });
+  });
+});
+
+function debugOpenFile(path) {
+  sw('files', document.querySelector('[data-panel=files]'));
+  fmNavigate(fmParent(path)).then(() => fmEdit(path));
+}
+
+async function loadDebugLogs() {
+  if (!activeServer) { toast('Select a server first.', 'error'); return; }
+  const lines = document.getElementById('dbg-log-lines').value || '500';
+  const box = document.getElementById('dbg-logs');
+  box.textContent = 'Fetching…';
+  const data = await apiCall(
+    `/api/server/${activeServer}/debug/logs?lines=${encodeURIComponent(lines)}` +
+    `&problems=${debugProblemsOnly}`);
+  if (!data) { box.textContent = 'Log stream unavailable (does the container exist?).'; return; }
+  debugLogs = data;
+  box.textContent = (data.lines || []).join('\n') ||
+    (debugProblemsOnly ? 'No errors or warnings in this window.' : 'No output.');
+  box.scrollTop = box.scrollHeight;
+  document.getElementById('dbg-log-meta').textContent =
+    `${data.total} line(s) scanned · ${data.problems} flagged` +
+    (data.filtered ? ' · showing flagged only' : '');
+}
+
+function toggleDebugProblems() {
+  debugProblemsOnly = !debugProblemsOnly;
+  const btn = document.getElementById('dbg-problems-btn');
+  btn.className = debugProblemsOnly ? 'mc-btn sm orange' : 'mc-btn sm';
+  btn.textContent = debugProblemsOnly ? 'SHOWING PROBLEMS' : 'PROBLEMS ONLY';
+  loadDebugLogs();
+}
+
+function toggleDebugAuto() {
+  const btn = document.getElementById('dbg-auto-btn');
+  if (debugAutoTimer) {
+    clearInterval(debugAutoTimer);
+    debugAutoTimer = null;
+    btn.className = 'mc-btn sm';
+    btn.textContent = 'AUTO: OFF';
+    return;
+  }
+  debugAutoTimer = setInterval(() => {
+    if (!activeServer || !document.getElementById('panel-debug').classList.contains('active')) return;
+    loadDebug(); loadDebugLogs();
+  }, 10000);
+  btn.className = 'mc-btn sm green';
+  btn.textContent = 'AUTO: ON';
+}
+
+async function loadDebugDisk() {
+  if (!activeServer) { toast('Select a server first.', 'error'); return; }
+  const el = document.getElementById('dbg-disk');
+  el.innerHTML = '<div class="empty">Measuring…</div>';
+  const data = await apiCall(`/api/server/${activeServer}/debug/disk`);
+  if (!data) { el.innerHTML = '<div class="empty err">Measurement failed.</div>'; return; }
+  debugDisk = data;
+  const max = Math.max(1, ...(data.entries || []).map(e => e.bytes));
+  el.innerHTML =
+    `<div class="card-hint">Volume total: <strong>${escapeHtml(data.total_human)}</strong></div>` +
+    ((data.entries || []).map(e => `
+      <div class="dbg-usage">
+        <div class="dbg-usage-lbl">
+          <span class="mono">${escapeHtml(e.name)}${e.dir ? '/' : ''}</span>
+          <span>${escapeHtml(e.human)}</span>
+        </div>
+        <div class="h-bar-bg"><div class="h-bar bar-g" style="width:${(e.bytes / max * 100).toFixed(1)}%"></div></div>
+      </div>`).join('') || '<div class="empty">Volume is empty.</div>');
+}
+
+// ---- Plain-text export ----------------------------------------------------
+function copyDebugReport() {
+  if (!debugData) { toast('Run a snapshot first.', 'error'); return; }
+  const d = debugData;
+  const L = [];
+  const section = (t) => { L.push('', `== ${t} ==`); };
+  const kv = (o) => Object.entries(o || {}).forEach(([k, v]) => L.push(`  ${k}: ${v}`));
+
+  L.push(`MC Cluster Manager — debug report for '${d.server}'`, `generated ${d.generated}`);
+  section('Findings');
+  (d.checks || []).forEach(c => L.push(`  [${c.level.toUpperCase()}] ${c.title} — ${c.detail}`));
+  section('Container');
+  kv({ ...d.container, health: JSON.stringify(d.container.health) });
+  section('Ports');
+  (d.ports || []).forEach(p => L.push(
+    `  ${p.ip}:${p.host || '-'} -> ${p.container}/${p.proto} ` +
+    `[${p.published ? (p.listening ? 'listening' : 'no answer') : 'unpublished'}]`));
+  section('Resources'); kv(d.stats);
+  section('Environment'); kv(d.env);
+  section('Properties'); kv(d.properties);
+  section('Key files');
+  (d.files || []).forEach(f => L.push(
+    `  ${f.path}: ${f.exists ? `${f.human} @ ${fmtTime(f.mtime)}` : 'missing'}`));
+  section('Crash reports');
+  (d.crash_reports || []).forEach(f => L.push(`  ${f.name} (${f.human} @ ${fmtTime(f.mtime)})`));
+  section('Host'); kv({ ...d.host, disk: JSON.stringify(d.host.disk), load: (d.host.load || []).join(' ') });
+  section('Recent manager actions');
+  (d.audit || []).forEach(l => L.push(`  ${l}`));
+  if (debugDisk) {
+    section(`Volume usage (total ${debugDisk.total_human})`);
+    (debugDisk.entries || []).forEach(e => L.push(`  ${e.human.padStart(10)}  ${e.name}`));
+  }
+  section('Processes'); L.push(d.top || '  (container not running)');
+  if (debugLogs) {
+    section(`Log tail${debugLogs.filtered ? ' (flagged lines only)' : ''}`);
+    (debugLogs.lines || []).forEach(l => L.push(`  ${l}`));
+  }
+
+  const text = L.join('\n');
+  const done = () => toast('Debug report copied to the clipboard.', 'ok');
+  if (navigator.clipboard && window.isSecureContext) {
+    navigator.clipboard.writeText(text).then(done,
+      () => toast('Clipboard blocked by the browser.', 'error'));
+    return;
+  }
+  // The manager is usually served over plain http, where the async clipboard
+  // API is unavailable.
+  const ta = document.createElement('textarea');
+  ta.value = text;
+  ta.style.position = 'fixed';
+  ta.style.opacity = '0';
+  document.body.appendChild(ta);
+  ta.select();
+  try { document.execCommand('copy') ? done() : toast('Copy failed.', 'error'); }
+  catch (e) { toast('Copy failed.', 'error'); }
+  document.body.removeChild(ta);
 }

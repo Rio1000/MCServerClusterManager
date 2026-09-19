@@ -18,7 +18,9 @@
   </script>
 </head>
 
-<body>
+<!-- no-target: nothing is selected yet, so the sidebar shows Instances only.
+     script.js drops the class the moment a server becomes the target. -->
+<body class="no-target">
 
   <!-- Toast notification container -->
   <div id="toast-container" aria-live="polite"></div>
@@ -39,7 +41,7 @@
     <div class="ctx-bar">
       <span class="ctx-label">Target</span>
       <span class="ctx-target" id="active-target">None</span>
-      <div class="ctx-actions">
+      <div class="ctx-actions needs-target">
         <button id="btn-start" class="mc-btn green" onclick="sendAction('start')">START</button>
         <button id="btn-stop" class="mc-btn red" onclick="sendAction('stop')">STOP</button>
         <button id="btn-restart" class="mc-btn" onclick="sendAction('restart')">RESTART</button>
@@ -54,35 +56,41 @@
           <i class="ti ti-server"></i> Instances
         </div>
 
-        <div class="sb-sec">Active Instance</div>
-        <div class="sb-item" data-panel="overview" onclick="sw('overview',this)">
+        <div class="sb-sec needs-target">Active Instance</div>
+        <div class="sb-item needs-target" data-panel="overview" onclick="sw('overview',this)">
           <i class="ti ti-layout-dashboard"></i> Overview
         </div>
-        <div class="sb-item" data-panel="console" onclick="sw('console',this)">
+        <div class="sb-item needs-target" data-panel="console" onclick="sw('console',this)">
           <i class="ti ti-terminal-2"></i> Console
         </div>
-        <div class="sb-item" data-panel="players" onclick="sw('players',this)">
+        <div class="sb-item needs-target" data-panel="players" onclick="sw('players',this)">
           <i class="ti ti-users"></i> Players
         </div>
 
-        <div class="sb-sec">Config</div>
-        <div class="sb-item" data-panel="properties" onclick="sw('properties',this)">
+        <div class="sb-sec needs-target">Config</div>
+        <div class="sb-item needs-target" data-panel="properties" onclick="sw('properties',this)">
           <i class="ti ti-file-text"></i> Properties
         </div>
-        <div class="sb-item" data-panel="world" onclick="sw('world',this)">
+        <div class="sb-item needs-target" data-panel="world" onclick="sw('world',this)">
           <i class="ti ti-world"></i> World
         </div>
 
-        <div class="sb-sec">Files</div>
-        <div class="sb-item" data-panel="upload" onclick="sw('upload',this)">
+        <div class="sb-sec needs-target">Files</div>
+        <div class="sb-item needs-target" data-panel="files" onclick="sw('files',this)">
+          <i class="ti ti-folder"></i> File Manager
+        </div>
+        <div class="sb-item needs-target" data-panel="upload" onclick="sw('upload',this)">
           <i class="ti ti-upload"></i> Upload Config
         </div>
-        <div class="sb-item" data-panel="mods" onclick="sw('mods',this)">
+        <div class="sb-item needs-target" data-panel="mods" onclick="sw('mods',this)">
           <i class="ti ti-package"></i> Mods
         </div>
 
-        <div class="sb-sec">System</div>
-        <div class="sb-item" data-panel="automation" onclick="sw('automation',this)">
+        <div class="sb-sec needs-target">System</div>
+        <div class="sb-item needs-target" data-panel="debug" onclick="sw('debug',this)">
+          <i class="ti ti-bug"></i> Debug
+        </div>
+        <div class="sb-item needs-target" data-panel="automation" onclick="sw('automation',this)">
           <i class="ti ti-clock"></i> Automation
         </div>
       </div>
@@ -160,6 +168,12 @@
               One per entry: <code>PORT</code>, <code>PORT/udp</code>, or <code>HOST:CONTAINER/udp</code>.
               Bedrock and Simple Voice Chat are UDP. Docker fixes bindings when the container is
               created, so these cannot be added to a server later.
+            </p>
+            <p class="card-hint" style="margin-top:4px;">
+              Leave <code>24454/udp</code> or <code>19132/udp</code> at their default numbers and a
+              busy port is moved to the next free one automatically, with the server's own config
+              updated to match — clients are told the new number during the handshake. Write an
+              explicit <code>HOST:CONTAINER/udp</code> mapping to place it yourself instead.
             </p>
 
             <div class="check-row">
@@ -323,6 +337,66 @@
           </div>
         </div>
 
+        <!-- ────────────── FILE MANAGER ────────────── -->
+        <div id="panel-files" class="panel">
+          <div class="panel-head">
+            <h2>File Manager</h2>
+            <p>Browse, edit, upload and remove files directly on the selected instance's volume.</p>
+          </div>
+
+          <div class="inv-panel">
+            <div class="inv-title">
+              <span>Volume Browser</span>
+              <div class="title-actions">
+                <button class="mc-btn sm" onclick="fmReload()">REFRESH</button>
+                <button class="mc-btn sm" onclick="fmNewFolder()">NEW FOLDER</button>
+                <button class="mc-btn sm" onclick="fmNewFile()">NEW FILE</button>
+                <button class="mc-btn sm" onclick="document.getElementById('fm-file-input').click()">UPLOAD</button>
+                <button class="mc-btn sm red" id="fm-del-btn" onclick="fmDeleteSelected()" disabled>DELETE</button>
+              </div>
+            </div>
+            <input type="file" id="fm-file-input" multiple style="display:none;" onchange="fmUploadInput(event)">
+
+            <div class="fm-bar">
+              <button class="mc-btn sm" id="fm-up-btn" onclick="fmUp()" disabled>UP</button>
+              <div class="fm-crumbs" id="fm-crumbs"></div>
+              <input type="text" id="fm-filter" class="mc-input" placeholder="Filter this folder…"
+                oninput="fmRenderList()">
+            </div>
+
+            <div class="fm-drop" id="fm-drop" ondragover="event.preventDefault();this.classList.add('drag')"
+              ondragleave="this.classList.remove('drag')" ondrop="fmHandleDrop(event)">
+              <div class="fm-row fm-head">
+                <span class="fm-c-check"><input type="checkbox" id="fm-check-all" onchange="fmToggleAll(this.checked)"></span>
+                <span class="fm-c-name">Name</span>
+                <span class="fm-c-size">Size</span>
+                <span class="fm-c-time">Modified</span>
+                <span class="fm-c-mode">Mode</span>
+                <span class="fm-c-act">Actions</span>
+              </div>
+              <div id="fm-list" class="fm-list">
+                <div class="empty">Select a server instance to browse its files.</div>
+              </div>
+            </div>
+            <div id="fm-status" class="status-line">Drop files anywhere on the list to upload them here.</div>
+          </div>
+
+          <div class="inv-panel" id="fm-editor-card" hidden>
+            <div class="inv-title">
+              <span>Editing <code id="fm-edit-path"></code></span>
+              <div class="title-actions">
+                <button class="mc-btn sm" onclick="fmCloseEditor()">CLOSE</button>
+              </div>
+            </div>
+            <textarea id="fm-editor" class="mc-textarea mono" rows="20" spellcheck="false"
+              oninput="fmMarkDirty()"></textarea>
+            <div class="save-bar">
+              <button class="mc-btn green" onclick="fmSaveEditor()">SAVE FILE</button>
+              <span id="fm-edit-hint" class="save-hint"></span>
+            </div>
+          </div>
+        </div>
+
         <!-- ────────────── UPLOAD ────────────── -->
         <div id="panel-upload" class="panel">
           <div class="panel-head">
@@ -424,6 +498,129 @@
           </div>
         </div>
 
+        <!-- ────────────── DEBUG ────────────── -->
+        <div id="panel-debug" class="panel">
+          <div class="panel-head">
+            <h2>Debug</h2>
+            <p>Every fact about the selected instance that matters when it will not start, in one snapshot.</p>
+          </div>
+
+          <div class="inv-panel">
+            <div class="inv-title">
+              <span>Diagnosis</span>
+              <div class="title-actions">
+                <span class="save-hint" id="dbg-generated"></span>
+                <button class="mc-btn sm" onclick="loadDebug()">REFRESH</button>
+                <button class="mc-btn sm" id="dbg-auto-btn" onclick="toggleDebugAuto()">AUTO: OFF</button>
+                <button class="mc-btn sm" onclick="copyDebugReport()">COPY REPORT</button>
+              </div>
+            </div>
+            <div id="dbg-checks">
+              <div class="empty">Select an instance to run diagnostics.</div>
+            </div>
+          </div>
+
+          <div class="col-2">
+            <div class="stack">
+              <div class="inv-panel">
+                <div class="inv-title"><span>Container</span></div>
+                <div class="kv-grid" id="dbg-container">
+                  <div class="empty">No data yet.</div>
+                </div>
+              </div>
+
+              <div class="inv-panel">
+                <div class="inv-title"><span>Port Bindings</span></div>
+                <div id="dbg-ports" class="scroll-box">
+                  <div class="empty">No data yet.</div>
+                </div>
+              </div>
+
+              <div class="inv-panel">
+                <div class="inv-title"><span>Live Resources</span></div>
+                <div class="kv-grid" id="dbg-stats">
+                  <div class="empty">No data yet.</div>
+                </div>
+                <h4 class="section-heading">Processes In Container</h4>
+                <pre class="log-box sm" id="dbg-top">—</pre>
+              </div>
+
+              <div class="inv-panel">
+                <div class="inv-title"><span>Container Environment</span></div>
+                <p class="card-hint">Anything that looks like a credential is reported as set / unset only.</p>
+                <div class="kv-grid" id="dbg-env">
+                  <div class="empty">No data yet.</div>
+                </div>
+              </div>
+
+              <div class="inv-panel">
+                <div class="inv-title">
+                  <span>Volume Usage</span>
+                  <div class="title-actions">
+                    <button class="mc-btn sm" onclick="loadDebugDisk()">MEASURE</button>
+                  </div>
+                </div>
+                <div id="dbg-disk">
+                  <div class="empty">Not measured — walking a large world takes a while, so it is on demand.</div>
+                </div>
+              </div>
+            </div>
+
+            <div class="stack">
+              <div class="inv-panel">
+                <div class="inv-title">
+                  <span>Log Tail</span>
+                  <div class="title-actions">
+                    <select id="dbg-log-lines" class="mc-select sm" onchange="loadDebugLogs()">
+                      <option value="200">200 lines</option>
+                      <option value="500" selected>500 lines</option>
+                      <option value="2000">2000 lines</option>
+                      <option value="5000">5000 lines</option>
+                    </select>
+                    <button class="mc-btn sm" id="dbg-problems-btn" onclick="toggleDebugProblems()">PROBLEMS ONLY</button>
+                    <button class="mc-btn sm" onclick="loadDebugLogs()">REFRESH</button>
+                  </div>
+                </div>
+                <pre class="log-box" id="dbg-logs">No data yet.</pre>
+                <div id="dbg-log-meta" class="status-line"></div>
+              </div>
+
+              <div class="inv-panel">
+                <div class="inv-title"><span>Key Files</span></div>
+                <div id="dbg-files">
+                  <div class="empty">No data yet.</div>
+                </div>
+                <h4 class="section-heading">Crash Reports</h4>
+                <div id="dbg-crash" class="scroll-box">
+                  <div class="empty">None.</div>
+                </div>
+                <h4 class="section-heading">Log Files On Disk</h4>
+                <div id="dbg-logfiles" class="scroll-box">
+                  <div class="empty">None.</div>
+                </div>
+              </div>
+
+              <div class="inv-panel">
+                <div class="inv-title"><span>Effective Properties</span></div>
+                <div class="kv-grid" id="dbg-props">
+                  <div class="empty">No data yet.</div>
+                </div>
+              </div>
+
+              <div class="inv-panel">
+                <div class="inv-title"><span>Host &amp; Manager</span></div>
+                <div class="kv-grid" id="dbg-host">
+                  <div class="empty">No data yet.</div>
+                </div>
+                <h4 class="section-heading">Recent Manager Actions</h4>
+                <div id="dbg-audit" class="scroll-box">
+                  <div class="empty">None.</div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
         <!-- ────────────── AUTOMATION ────────────── -->
         <div id="panel-automation" class="panel">
           <div class="panel-head">
@@ -490,6 +687,94 @@
         </div>
         <div class="tab-row" id="modal-tabs"></div>
         <div id="modal-pdata" class="modal-content">Connecting to RCON feed…</div>
+      </div>
+    </div>
+
+    <!-- ===== Duplicate Server Modal ===== -->
+    <div id="dup-modal" class="modal-overlay">
+      <div class="modal-box">
+        <div class="modal-title">
+          <span>Duplicate <code id="dup-source"></code></span>
+          <button class="mc-btn red sm" onclick="closeDuplicate()">CLOSE</button>
+        </div>
+        <div class="modal-content">
+          <div class="form-grid">
+            <div class="field">
+              <label class="field-lbl" for="dup-name">New Container ID</label>
+              <input type="text" id="dup-name" class="mc-input">
+            </div>
+            <div class="field">
+              <label class="field-lbl" for="dup-port">Port</label>
+              <input type="text" id="dup-port" class="mc-input" placeholder="25566">
+            </div>
+            <div class="field">
+              <label class="field-lbl" for="dup-world">World Name</label>
+              <input type="text" id="dup-world" class="mc-input" value="world">
+            </div>
+            <div class="field">
+              <label class="field-lbl" for="dup-seed">Seed (optional)</label>
+              <input type="text" id="dup-seed" class="mc-input" placeholder="random">
+            </div>
+          </div>
+          <p class="card-hint" style="margin-top:8px;">
+            Copies mods, plugins, config, the pinned server jar and the world's datapacks.
+            The world itself is not copied — the clone generates a fresh one and the datapacks
+            are replanted into it. Voice chat and Bedrock ports are carried over, shifted to
+            free numbers if the originals are busy.
+          </p>
+          <div class="save-bar" style="margin-top:10px;">
+            <button id="btn-dup-go" class="mc-btn green" onclick="runDuplicate()">Clone Node</button>
+            <span class="save-hint">The source server is never modified.</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ===== Update Server Modal ===== -->
+    <div id="upd-modal" class="modal-overlay">
+      <div class="modal-box">
+        <div class="modal-title">
+          <span>Update <code id="upd-source"></code>
+            <span class="save-hint" id="upd-state"></span></span>
+          <button class="mc-btn red sm" onclick="closeUpdate()">CLOSE</button>
+        </div>
+        <div class="modal-content">
+          <p class="card-hint">
+            Current version: <code id="upd-current">?</code>. Runs the existing
+            <code>mc-update.py</code> / <code>packwiz</code> / <code>mc-chunkdiff.py</code>
+            tooling — nothing new decides what is safe to upgrade.
+          </p>
+
+          <div id="upd-scopes" style="margin-top:10px;"></div>
+
+          <div class="form-grid" style="margin-top:10px;">
+            <div class="field">
+              <label class="field-lbl" for="upd-target">Target Version</label>
+              <input type="text" id="upd-target" class="mc-input" placeholder="latest release">
+            </div>
+            <div class="field">
+              <label class="field-lbl" for="upd-dimension">Dimension (world scope)</label>
+              <select id="upd-dimension" class="mc-select">
+                <option value="">all</option>
+                <option value="overworld">overworld</option>
+                <option value="the_nether">the_nether</option>
+                <option value="the_end">the_end</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="btn-row" style="margin-top:8px;">
+            <button class="mc-btn" onclick="runUpdateCheck()">Check Compatibility</button>
+            <button id="btn-upd-go" class="mc-btn green" onclick="runUpdateApply()">Run Update</button>
+          </div>
+          <p class="card-hint" style="margin-top:6px;">
+            A version update takes a borg backup first and restores it if the server
+            fails to boot. The check is read-only and always safe to run.
+          </p>
+
+          <div id="upd-report" style="margin-top:10px;"></div>
+          <pre id="upd-log" class="modal-content" style="max-height:220px;overflow:auto;"></pre>
+        </div>
       </div>
     </div>
 
