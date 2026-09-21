@@ -241,7 +241,9 @@ function connectWS() {
       document.getElementById('stat-players').textContent = `${players.length}/${maxPlayers}`;
       document.getElementById('p-count-lbl').textContent = `Online: ${players.length} / ${maxPlayers}`;
 
+      rememberPlayers(players);
       renderPlayerRows(players);
+      refreshPlayerDatalist();
     }
 
     // Player NBT
@@ -462,6 +464,245 @@ function clearConsole() {
 }
 
 // ---------------------------------------------------------------------------
+// Console autocomplete
+//
+// Modelled on the in-game command box: a suggestion list above the input,
+// Tab to accept, arrows to move through it. RCON takes the same commands the
+// chat box does, so the same affordance applies — the difference is that the
+// real client gets its command tree from the server and this cannot, so the
+// table below is a curated set of vanilla commands rather than a live one.
+//
+// Argument completion is deliberately shallow: the first argument or two,
+// which is where the guessing actually happens (was it `gamemode creative
+// Steve` or `gamemode Steve creative`?). Deep coordinate and NBT completion
+// is left alone.
+// ---------------------------------------------------------------------------
+const GAMEMODES_ARG  = ['survival', 'creative', 'adventure', 'spectator'];
+const DIFFICULTIES   = ['peaceful', 'easy', 'normal', 'hard'];
+
+// '@player' is resolved at suggest time against who is online plus whoever is
+// on the whitelist, so the list reflects this server rather than a fixed set.
+const COMMANDS = {
+  'advancement':     { hint: '<grant|revoke> <targets> …', args: [['grant', 'revoke'], '@player'] },
+  'attribute':       { hint: '<target> <attribute> …', args: ['@player'] },
+  'ban':             { hint: '<name> [reason]', args: ['@player'] },
+  'ban-ip':          { hint: '<address|name> [reason]', args: ['@player'] },
+  'banlist':         { hint: '[ips|players]', args: [['ips', 'players']] },
+  'clear':           { hint: '[targets] [item] [count]', args: ['@player'] },
+  'damage':          { hint: '<target> <amount> [type]', args: ['@player'] },
+  'data':            { hint: '<get|merge|modify|remove> …', args: [['get', 'merge', 'modify', 'remove']] },
+  'datapack':        { hint: '<list|enable|disable> …', args: [['list', 'enable', 'disable']] },
+  'debug':           { hint: '<start|stop|function>', args: [['start', 'stop', 'function']] },
+  'defaultgamemode': { hint: '<mode>', args: [GAMEMODES_ARG] },
+  'deop':            { hint: '<player>', args: ['@player'] },
+  'difficulty':      { hint: '[difficulty]', args: [DIFFICULTIES] },
+  'effect':          { hint: '<give|clear> <targets> …', args: [['give', 'clear'], '@player'] },
+  'enchant':         { hint: '<targets> <enchantment> [level]', args: ['@player'] },
+  'execute':         { hint: '<as|at|if|run|…> …', args: [['as', 'at', 'align', 'anchored', 'facing', 'in', 'positioned', 'rotated', 'if', 'unless', 'store', 'run']] },
+  'experience':      { hint: '<add|set|query> <targets> …', args: [['add', 'set', 'query'], '@player'] },
+  'fill':            { hint: '<from> <to> <block> …', args: [] },
+  'forceload':       { hint: '<add|remove|query> …', args: [['add', 'remove', 'query']] },
+  'function':        { hint: '<name>', args: [] },
+  'gamemode':        { hint: '<mode> [target]', args: [GAMEMODES_ARG, '@player'] },
+  'gamerule':        { hint: '<rule> [value]', args: ['@gamerule'] },
+  'give':            { hint: '<targets> <item> [count]', args: ['@player'] },
+  'help':            { hint: '[command]', args: ['@command'] },
+  'kick':            { hint: '<player> [reason]', args: ['@player'] },
+  'kill':            { hint: '[targets]', args: ['@player'] },
+  'list':            { hint: '[uuids]', args: [['uuids']] },
+  'locate':          { hint: '<structure|biome|poi> …', args: [['structure', 'biome', 'poi']] },
+  'me':              { hint: '<action>', args: [] },
+  'msg':             { hint: '<targets> <message>', args: ['@player'] },
+  'op':              { hint: '<player>', args: ['@player'] },
+  'pardon':          { hint: '<name>', args: ['@player'] },
+  'pardon-ip':       { hint: '<address>', args: [] },
+  'particle':        { hint: '<name> [pos] …', args: [] },
+  'playsound':       { hint: '<sound> <source> <targets> …', args: [] },
+  'recipe':          { hint: '<give|take> <targets> <recipe>', args: [['give', 'take'], '@player'] },
+  'reload':          { hint: 'reload datapacks', args: [] },
+  'save-all':        { hint: '[flush]', args: [['flush']] },
+  'save-off':        { hint: 'disable autosave', args: [] },
+  'save-on':         { hint: 'enable autosave', args: [] },
+  'say':             { hint: '<message>', args: [] },
+  'scoreboard':      { hint: '<objectives|players> …', args: [['objectives', 'players']] },
+  'seed':            { hint: 'show the world seed', args: [] },
+  'setblock':        { hint: '<pos> <block> …', args: [] },
+  'setidletimeout':  { hint: '<minutes>', args: [] },
+  'setworldspawn':   { hint: '[pos] [angle]', args: [] },
+  'spawnpoint':      { hint: '[targets] [pos]', args: ['@player'] },
+  'spectate':        { hint: '[target] [player]', args: ['@player', '@player'] },
+  'spreadplayers':   { hint: '<center> <spread> …', args: [] },
+  'stop':            { hint: 'stop the server', args: [] },
+  'stopsound':       { hint: '<targets> [source] [sound]', args: ['@player'] },
+  'summon':          { hint: '<entity> [pos] [nbt]', args: [] },
+  'tag':             { hint: '<targets> <add|remove|list> …', args: ['@player', ['add', 'remove', 'list']] },
+  'team':            { hint: '<list|add|remove|join|…> …', args: [['list', 'add', 'remove', 'empty', 'join', 'leave', 'modify']] },
+  'teleport':        { hint: '<target> <destination>', args: ['@player', '@player'] },
+  'tell':            { hint: '<targets> <message>', args: ['@player'] },
+  'tellraw':         { hint: '<targets> <json>', args: ['@player'] },
+  'time':            { hint: '<set|add|query> <value>', args: [['set', 'add', 'query'], ['day', 'night', 'noon', 'midnight', 'sunrise', 'sunset']] },
+  'title':           { hint: '<targets> <title|subtitle|…> …', args: ['@player', ['title', 'subtitle', 'actionbar', 'clear', 'reset', 'times']] },
+  'tp':              { hint: '<target> <destination>', args: ['@player', '@player'] },
+  'transfer':        { hint: '<host> [port] [players]', args: [] },
+  'trigger':         { hint: '<objective> …', args: [] },
+  'weather':         { hint: '<clear|rain|thunder> [duration]', args: [['clear', 'rain', 'thunder']] },
+  'whitelist':       { hint: '<on|off|list|add|remove|reload>', args: [['on', 'off', 'list', 'add', 'remove', 'reload'], '@player'] },
+  'worldborder':     { hint: '<add|set|center|…> …', args: [['add', 'set', 'center', 'damage', 'get', 'warning']] },
+  'xp':              { hint: '<add|set|query> <targets> …', args: [['add', 'set', 'query'], '@player'] },
+};
+
+const GAMERULES = [
+  'announceAdvancements', 'blockExplosionDropDecay', 'commandBlockOutput',
+  'commandModificationBlockLimit', 'disableElytraMovementCheck', 'disableRaids',
+  'doDaylightCycle', 'doEntityDrops', 'doFireTick', 'doImmediateRespawn',
+  'doInsomnia', 'doLimitedCrafting', 'doMobLoot', 'doMobSpawning', 'doPatrolSpawning',
+  'doTileDrops', 'doTraderSpawning', 'doVinesSpread', 'doWardenSpawning',
+  'doWeatherCycle', 'drowningDamage', 'enderPearlsVanishOnDeath', 'fallDamage',
+  'fireDamage', 'forgiveDeadPlayers', 'freezeDamage', 'globalSoundEvents',
+  'keepInventory', 'lavaSourceConversion', 'logAdminCommands', 'maxCommandChainLength',
+  'maxEntityCramming', 'mobExplosionDropDecay', 'mobGriefing', 'naturalRegeneration',
+  'playersNetherPortalCreativeDelay', 'playersNetherPortalDefaultDelay',
+  'playersSleepingPercentage', 'projectilesCanBreakBlocks', 'randomTickSpeed',
+  'reducedDebugInfo', 'sendCommandFeedback', 'showDeathMessages', 'snowAccumulationHeight',
+  'spawnRadius', 'spectatorsGenerateChunks', 'tntExplosionDropDecay',
+  'universalAnger', 'waterSourceConversion',
+];
+
+// Names seen online, kept so completion still works for someone who logged off
+// a minute ago. Topped up from the player list and the whitelist.
+let knownPlayers = new Set();
+
+function rememberPlayers(names) {
+  (names || []).forEach(n => { if (n) knownPlayers.add(n); });
+}
+
+function playerCandidates() {
+  return [...knownPlayers].sort((a, b) => a.localeCompare(b));
+}
+
+function resolveArgSource(source) {
+  if (source === '@player') return playerCandidates();
+  if (source === '@gamerule') return GAMERULES;
+  if (source === '@command') return Object.keys(COMMANDS);
+  return Array.isArray(source) ? source : [];
+}
+
+/**
+ * Work out what is being typed and what could finish it.
+ * Returns { items, from, to, hint } where from/to bound the token to replace.
+ */
+function computeSuggestions(value, caret) {
+  const upto = value.slice(0, caret);
+  // A leading slash is optional over RCON; accept it and ignore it.
+  const lead = upto.startsWith('/') ? 1 : 0;
+  const body = upto.slice(lead);
+
+  const tokenStart = body.lastIndexOf(' ') + 1;
+  const token = body.slice(tokenStart);
+  const from = lead + tokenStart;
+
+  // Still on the first word: complete the command itself.
+  if (tokenStart === 0) {
+    const items = Object.keys(COMMANDS)
+      .filter(c => c.startsWith(token.toLowerCase()))
+      .map(c => ({ value: c, hint: COMMANDS[c].hint }));
+    return { items, from, to: caret, hint: '' };
+  }
+
+  const name = body.slice(0, body.indexOf(' ')).toLowerCase();
+  const spec = COMMANDS[name];
+  if (!spec) return { items: [], from, to: caret, hint: '' };
+
+  // Which argument slot the caret sits in, counting from zero.
+  const argIndex = body.slice(0, tokenStart).trim().split(/\s+/).length - 1;
+  const source = spec.args[argIndex];
+  if (!source) return { items: [], from, to: caret, hint: `${name} ${spec.hint}` };
+
+  const lower = token.toLowerCase();
+  const items = resolveArgSource(source)
+    .filter(v => v.toLowerCase().startsWith(lower))
+    .map(v => ({ value: v, hint: '' }));
+  return { items, from, to: caret, hint: `${name} ${spec.hint}` };
+}
+
+// --- Suggestion popup ------------------------------------------------------
+const SUGGEST_MAX = 8;
+
+let suggestState = { items: [], index: 0, from: 0, to: 0, open: false };
+
+function suggestBox() { return document.getElementById('console-suggest'); }
+
+function closeSuggest() {
+  suggestState.open = false;
+  const box = suggestBox();
+  if (box) { box.hidden = true; box.innerHTML = ''; }
+}
+
+function renderSuggest(hint) {
+  const box = suggestBox();
+  if (!box) return;
+  const { items, index } = suggestState;
+  if (!items.length) {
+    // No candidates, but a usage line is still worth showing.
+    if (hint) {
+      box.hidden = false;
+      box.innerHTML = `<div class="sg-hint mono">${escapeHtml(hint)}</div>`;
+      suggestState.open = false;
+      return;
+    }
+    closeSuggest();
+    return;
+  }
+  const shown = items.slice(0, SUGGEST_MAX);
+  box.hidden = false;
+  box.innerHTML =
+    (hint ? `<div class="sg-hint mono">${escapeHtml(hint)}</div>` : '')
+    + shown.map((it, i) => `
+        <button type="button" class="sg-item${i === index ? ' active' : ''}" data-i="${i}">
+          <span class="sg-val mono">${escapeHtml(it.value)}</span>
+          ${it.hint ? `<span class="sg-arg mono">${escapeHtml(it.hint)}</span>` : ''}
+        </button>`).join('')
+    + (items.length > shown.length
+        ? `<div class="sg-more">+${items.length - shown.length} more — keep typing</div>` : '');
+  suggestState.open = true;
+}
+
+function updateSuggest() {
+  const inp = document.getElementById('console-input');
+  if (!inp) return;
+  const value = inp.value;
+  if (!value.trim()) { closeSuggest(); return; }
+  const { items, from, to, hint } = computeSuggestions(value, inp.selectionStart ?? value.length);
+  // Nothing to offer when the only candidate is already typed in full.
+  const typed = value.slice(from, to);
+  const useful = items.filter(it => it.value !== typed);
+  suggestState = { items: useful, index: 0, from, to, open: false };
+  renderSuggest(hint);
+}
+
+function acceptSuggest(i) {
+  const inp = document.getElementById('console-input');
+  const pick = suggestState.items[i ?? suggestState.index];
+  if (!inp || !pick) return false;
+  const before = inp.value.slice(0, suggestState.from);
+  const after = inp.value.slice(suggestState.to);
+  // A trailing space is what makes chaining arguments feel right.
+  inp.value = `${before}${pick.value} ${after}`;
+  const caret = (before + pick.value + ' ').length;
+  inp.focus();
+  inp.setSelectionRange(caret, caret);
+  updateSuggest();
+  return true;
+}
+
+function moveSuggest(delta) {
+  const n = Math.min(suggestState.items.length, SUGGEST_MAX);
+  if (!n) return;
+  suggestState.index = (suggestState.index + delta + n) % n;
+  renderSuggest(document.querySelector('#console-suggest .sg-hint')?.textContent || '');
+}
+
+// ---------------------------------------------------------------------------
 // Command history — up/down through what was sent, per browser, across reloads
 // ---------------------------------------------------------------------------
 const CMD_HISTORY_KEY = 'mc-cmd-history';
@@ -493,8 +734,39 @@ function pushCmdHistory(cmd) {
 
 function consoleKeydown(ev) {
   const inp = ev.target;
-  if (ev.key === 'Enter') { sendTerminalCommand(); return; }
+
+  // Tab accepts the highlighted suggestion, exactly as the game does. It also
+  // has to be swallowed unconditionally, or focus escapes to the next control.
+  if (ev.key === 'Tab') {
+    ev.preventDefault();
+    if (suggestState.open) {
+      if (ev.shiftKey) moveSuggest(-1);
+      else acceptSuggest();
+    }
+    return;
+  }
+
+  if (ev.key === 'Escape') {
+    if (suggestState.open) { ev.preventDefault(); closeSuggest(); }
+    return;
+  }
+
+  if (ev.key === 'Enter') {
+    closeSuggest();
+    sendTerminalCommand();
+    return;
+  }
+
   if (ev.key !== 'ArrowUp' && ev.key !== 'ArrowDown') return;
+
+  // Arrows drive the suggestion list while it is up, and the history when it
+  // is not — the same split the in-game box uses.
+  if (suggestState.open) {
+    ev.preventDefault();
+    moveSuggest(ev.key === 'ArrowUp' ? -1 : 1);
+    return;
+  }
+
   if (!cmdHistory.length) return;
   ev.preventDefault();
 
@@ -503,7 +775,10 @@ function consoleKeydown(ev) {
   cmdCursor = Math.max(0, Math.min(cmdCursor, cmdHistory.length));
   inp.value = cmdCursor === cmdHistory.length ? cmdDraft : cmdHistory[cmdCursor];
   // Park the caret at the end, or typing lands in the middle of the recalled line.
-  requestAnimationFrame(() => inp.setSelectionRange(inp.value.length, inp.value.length));
+  requestAnimationFrame(() => {
+    inp.setSelectionRange(inp.value.length, inp.value.length);
+    updateSuggest();
+  });
 }
 
 function sendTerminalCommand() {
@@ -515,6 +790,7 @@ function sendTerminalCommand() {
     logTerm(`> ${val}`);
     pushCmdHistory(val);
     inp.value = '';
+    closeSuggest();
   }
 }
 
@@ -599,6 +875,9 @@ async function populateVersionsDynamically() {
       html += `</optgroup>`;
     });
     sel.innerHTML = html;
+    // The same list feeds the Modrinth version box, newest first — that is the
+    // end people actually want.
+    fillVersionDatalist(releases.map(v => v.id));
   } catch {
     sel.innerHTML = `
       <option value="LATEST">Latest Release</option>
@@ -607,7 +886,15 @@ async function populateVersionsDynamically() {
         <option value="1.20.4">1.20.4</option>
         <option value="1.19.4">1.19.4</option>
       </optgroup>`;
+    fillVersionDatalist(['1.21.1', '1.20.4', '1.19.4']);
   }
+}
+
+function fillVersionDatalist(ids) {
+  const el = document.getElementById('mc-versions');
+  if (!el) return;
+  el.innerHTML = ids.slice(0, 80)
+    .map(v => `<option value="${escapeHtml(v)}"></option>`).join('');
 }
 
 // ---------------------------------------------------------------------------
@@ -1140,15 +1427,19 @@ function handlePlayerRowClick(ev) {
   playerAction(player, act, reason);
 }
 
-// The reason box only means something for kick and ban; gamemode reuses it as
-// the mode, so the placeholder has to say which one is being asked for.
+// The third control depends on the action: a gamemode picker for gamemode, a
+// free-text reason for kick/ban, and nothing at all for the rest.
 function syncModArg() {
   const action = document.getElementById('mod-action').value;
   const arg = document.getElementById('mod-arg');
-  if (action === 'gamemode') {
-    arg.placeholder = 'survival | creative | adventure | spectator';
-    arg.disabled = false;
-  } else if (action === 'kick' || action === 'ban') {
+  const mode = document.getElementById('mod-gamemode');
+  const isGamemode = action === 'gamemode';
+
+  arg.hidden = isGamemode;
+  mode.hidden = !isGamemode;
+
+  if (isGamemode) return;
+  if (action === 'kick' || action === 'ban') {
     arg.placeholder = 'Reason (optional)';
     arg.disabled = false;
   } else {
@@ -1161,9 +1452,21 @@ function syncModArg() {
 function runModAction() {
   const player = document.getElementById('mod-player').value.trim();
   const action = document.getElementById('mod-action').value;
-  const arg = document.getElementById('mod-arg').value.trim();
+  const arg = action === 'gamemode'
+    ? document.getElementById('mod-gamemode').value
+    : document.getElementById('mod-arg').value.trim();
   if (!player) { toast('Enter a player name.', 'error'); return; }
   playerAction(player, action, arg);
+}
+
+// Datalists let the browser do the filtering for us: the name fields stay
+// free text (a player who has never joined still has to be typeable) but
+// offer everyone we know about.
+function refreshPlayerDatalist() {
+  const el = document.getElementById('known-players');
+  if (!el) return;
+  el.innerHTML = playerCandidates()
+    .map(n => `<option value="${escapeHtml(n)}"></option>`).join('');
 }
 
 // ---------------------------------------------------------------------------
@@ -1218,6 +1521,12 @@ async function loadAccessList() {
   }
 
   const rows = data.entries || [];
+  // Whitelist and ops names are the best source of completions for players who
+  // are not online right now.
+  if (accessKind === 'whitelist' || accessKind === 'ops') {
+    rememberPlayers(rows.map(r => r.name).filter(Boolean));
+    refreshPlayerDatalist();
+  }
   el.innerHTML = !rows.length
     ? `<div class="empty">Nothing in ${escapeHtml(data.file || accessKind)}.</div>`
     : rows.map(r => {
@@ -1763,12 +2072,74 @@ async function loadPropsFromServer() {
   renderBothGrids();
 }
 
+// server.properties is mostly true/false and small enumerations, and typing
+// those by hand is where the typos come from — a misspelled "fasle" is
+// silently the same as false to the server, but not to anyone reading it.
+// Anything not listed here stays a free text box.
+const PROP_BOOLEANS = new Set([
+  'accepts-transfers', 'allow-flight', 'allow-nether', 'broadcast-console-to-ops',
+  'broadcast-rcon-to-ops', 'debug', 'enable-command-block', 'enable-jmx-monitoring',
+  'enable-query', 'enable-rcon', 'enable-status', 'enforce-secure-profile',
+  'enforce-whitelist', 'force-gamemode', 'generate-structures', 'hardcore',
+  'hide-online-players', 'log-ips', 'online-mode', 'prevent-proxy-connections',
+  'pvp', 'require-resource-pack', 'spawn-animals', 'spawn-monsters', 'spawn-npcs',
+  'sync-chunk-writes', 'use-native-transport', 'white-list',
+]);
+
+const PROP_ENUMS = {
+  'gamemode':   ['survival', 'creative', 'adventure', 'spectator'],
+  'difficulty': ['peaceful', 'easy', 'normal', 'hard'],
+  'level-type': ['minecraft:normal', 'minecraft:flat', 'minecraft:large_biomes',
+                 'minecraft:amplified', 'minecraft:single_biome_surface'],
+  'region-file-compression': ['deflate', 'lz4', 'none'],
+  'op-permission-level':       ['1', '2', '3', '4'],
+  'function-permission-level': ['1', '2', '3', '4'],
+};
+
+// Numeric fields get a number input with sane bounds — a spinner and the
+// browser's own validation beat a free text box that accepts "twenty".
+const PROP_NUMBERS = {
+  'server-port': [1, 65535], 'query.port': [1, 65535], 'rcon.port': [1, 65535],
+  'max-players': [0, 100000], 'view-distance': [2, 32], 'simulation-distance': [2, 32],
+  'spawn-protection': [0, 10000], 'max-build-height': [0, 4064],
+  'player-idle-timeout': [0, 525600], 'max-tick-time': [-1, 600000],
+  'network-compression-threshold': [-1, 65536], 'rate-limit': [0, 10000],
+  'entity-broadcast-range-percentage': [10, 1000], 'max-world-size': [1, 29999984],
+  'max-chained-neighbor-updates': [-2147483648, 2147483647],
+  'pause-when-empty-seconds': [-1, 86400], 'text-filtering-version': [0, 100],
+};
+
+function propControl(k, v) {
+  const id = `prop-${escapeHtml(k)}`;
+  const onchange = `onchange="updatePropMemory('${escapeHtml(k)}',this.value)"`;
+  const options = PROP_BOOLEANS.has(k) ? ['true', 'false'] : PROP_ENUMS[k];
+
+  if (options) {
+    // An unrecognised stored value is kept as an extra option rather than
+    // silently rewritten to something the user never chose.
+    const known = options.includes(String(v));
+    const all = known || v === undefined || v === '' ? options : [String(v), ...options];
+    return `<select class="mc-select" id="${id}" ${onchange}>`
+      + all.map(o =>
+          `<option value="${escapeHtml(o)}"${String(v) === o ? ' selected' : ''}>${escapeHtml(o)}${
+            known || o !== String(v) ? '' : ' (current)'}</option>`).join('')
+      + `</select>`;
+  }
+
+  const range = PROP_NUMBERS[k];
+  if (range && (v === '' || v === undefined || /^-?\d+$/.test(String(v)))) {
+    return `<input class="mc-input" type="number" id="${id}" value="${escapeHtml(v)}"
+      min="${range[0]}" max="${range[1]}" step="1" ${onchange}>`;
+  }
+
+  return `<input class="mc-input" id="${id}" value="${escapeHtml(v)}" ${onchange}>`;
+}
+
 function propSlot(k, v) {
   return `
       <div class="prop-slot" data-key="${escapeHtml(k)}">
         <div class="prop-lbl" title="${escapeHtml(k)}">${escapeHtml(k)}</div>
-        <input class="mc-input" id="prop-${escapeHtml(k)}" value="${escapeHtml(v)}"
-          onchange="updatePropMemory('${escapeHtml(k)}',this.value)">
+        ${propControl(k, v)}
       </div>`;
 }
 
@@ -2475,6 +2846,22 @@ async function loadJobs() {
         </div>`).join('');
 }
 
+// The preset dropdown writes into the expression box rather than replacing it,
+// so the schedule stays visible and editable instead of being hidden behind a
+// label. Editing it by hand flips the dropdown to Custom.
+function applyCronPreset(expr) {
+  if (!expr) return;
+  document.getElementById('cron-str').value = expr;
+}
+
+function markCronCustom() {
+  const preset = document.getElementById('cron-preset');
+  const current = document.getElementById('cron-str').value.trim();
+  if (!preset) return;
+  const match = [...preset.options].find(o => o.value && o.value === current);
+  preset.value = match ? match.value : '';
+}
+
 async function createJob() {
   if (!activeServer) { toast('Select a target server first.', 'error'); return; }
   const cronStr = document.getElementById('cron-str').value.trim();
@@ -3158,6 +3545,13 @@ document.addEventListener('DOMContentLoaded', () => {
     const hit = ev.target.closest('[data-act="mr-add"]');
     if (!hit) return;
     modrinthAdd(hit.closest('.mr-row').dataset.slug);
+  });
+
+  // Clicking a suggestion has to beat the input's blur handler, which is why
+  // the blur close is delayed rather than immediate.
+  on('console-suggest', ev => {
+    const hit = ev.target.closest('.sg-item');
+    if (hit) acceptSuggest(Number(hit.dataset.i));
   });
 
   on('cluster-graphs', ev => {

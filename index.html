@@ -25,6 +25,11 @@
   <!-- Toast notification container -->
   <div id="toast-container" aria-live="polite"></div>
 
+  <!-- Shared suggestion sources. Both are filled by script.js: players from
+       who is online plus the whitelist, versions from the Mojang manifest. -->
+  <datalist id="known-players"></datalist>
+  <datalist id="mc-versions"></datalist>
+
   <div class="mc-wrap">
 
     <!-- ===== TOP BAR ===== -->
@@ -333,12 +338,19 @@
               <span id="console-filter-count" class="muted-count"></span>
             </div>
             <div class="console-box" id="console-log"></div>
-            <div class="cin-row">
-              <span class="cin-prompt">&gt;</span>
-              <input type="text" class="mc-input-lg" id="console-input"
-                placeholder="Enter command…  (↑/↓ for history)" autocomplete="off"
-                onkeydown="consoleKeydown(event)">
-              <button class="mc-btn green" onclick="sendTerminalCommand()">EXEC</button>
+            <div class="cin-wrap">
+              <!-- Suggestion list sits above the prompt, like the in-game box -->
+              <div id="console-suggest" class="sg-box" hidden role="listbox"
+                aria-label="Command suggestions"></div>
+              <div class="cin-row">
+                <span class="cin-prompt">&gt;</span>
+                <input type="text" class="mc-input-lg" id="console-input"
+                  placeholder="Enter command…  (Tab to complete, ↑/↓ for history)"
+                  autocomplete="off" spellcheck="false"
+                  onkeydown="consoleKeydown(event)" oninput="updateSuggest()"
+                  onblur="setTimeout(closeSuggest, 150)">
+                <button class="mc-btn green" onclick="sendTerminalCommand()">EXEC</button>
+              </div>
             </div>
           </div>
 
@@ -374,7 +386,7 @@
               go over RCON, so the server has to be running.</p>
             <div class="act-row">
               <input type="text" class="mc-input" id="mod-player" placeholder="Player name"
-                maxlength="32" aria-label="Player name">
+                maxlength="32" aria-label="Player name" list="known-players" autocomplete="off">
               <select class="mc-select" id="mod-action" onchange="syncModArg()" aria-label="Action">
                 <option value="kick">Kick</option>
                 <option value="ban">Ban</option>
@@ -386,8 +398,15 @@
                 <option value="gamemode">Set gamemode</option>
                 <option value="kill">Kill</option>
               </select>
+              <!-- Swapped for a gamemode picker by syncModArg() -->
               <input type="text" class="mc-input" id="mod-arg" placeholder="Reason (optional)"
                 maxlength="120" aria-label="Reason">
+              <select class="mc-select" id="mod-gamemode" aria-label="Gamemode" hidden>
+                <option value="survival">Survival</option>
+                <option value="creative">Creative</option>
+                <option value="adventure">Adventure</option>
+                <option value="spectator">Spectator</option>
+              </select>
               <button class="mc-btn green" onclick="runModAction()">RUN</button>
             </div>
           </div>
@@ -407,7 +426,7 @@
             </p>
             <div class="act-row">
               <input type="text" class="mc-input" id="access-value" placeholder="Player name"
-                maxlength="45" aria-label="Entry to add">
+                maxlength="45" aria-label="Entry to add" list="known-players" autocomplete="off">
               <input type="text" class="mc-input" id="access-reason" placeholder="Reason (bans only)"
                 maxlength="120" aria-label="Reason">
               <button class="mc-btn green" onclick="accessAdd()">ADD</button>
@@ -616,10 +635,24 @@
                     <option value="modpack">Modpacks</option>
                     <option value="shader">Shaders</option>
                   </select>
-                  <input type="text" class="mc-input" id="mr-loader" placeholder="Loader (fabric)"
-                    maxlength="16" aria-label="Loader">
-                  <input type="text" class="mc-input" id="mr-version" placeholder="MC version"
-                    maxlength="24" aria-label="Game version">
+                  <select class="mc-select" id="mr-loader" aria-label="Loader">
+                    <option value="">Any loader</option>
+                    <option value="fabric">Fabric</option>
+                    <option value="forge">Forge</option>
+                    <option value="neoforge">NeoForge</option>
+                    <option value="quilt">Quilt</option>
+                    <option value="paper">Paper</option>
+                    <option value="spigot">Spigot</option>
+                    <option value="bukkit">Bukkit</option>
+                    <option value="purpur">Purpur</option>
+                    <option value="folia">Folia</option>
+                    <option value="velocity">Velocity</option>
+                    <option value="bungeecord">BungeeCord</option>
+                  </select>
+                  <!-- Free text with suggestions: the manifest covers releases,
+                       but a snapshot or a custom build still has to be typeable. -->
+                  <input type="text" class="mc-input" id="mr-version" placeholder="Any version"
+                    maxlength="24" aria-label="Game version" list="mc-versions" autocomplete="off">
                 </div>
                 <div id="mr-results" class="scroll-box tall">
                   <div class="empty">Search to see results.</div>
@@ -841,8 +874,21 @@
               </div>
               <div class="grid-auto">
                 <div class="field">
+                  <label class="field-lbl" for="cron-preset">Schedule</label>
+                  <select id="cron-preset" class="mc-select" onchange="applyCronPreset(this.value)">
+                    <option value="0 4 * * *">Daily at 4:00 AM</option>
+                    <option value="0 */6 * * *">Every 6 hours</option>
+                    <option value="0 */12 * * *">Every 12 hours</option>
+                    <option value="0 3 * * 0">Weekly — Sunday 3:00 AM</option>
+                    <option value="0 5 1 * *">Monthly — 1st at 5:00 AM</option>
+                    <option value="*/30 * * * *">Every 30 minutes</option>
+                    <option value="">Custom…</option>
+                  </select>
+                </div>
+                <div class="field">
                   <label class="field-lbl" for="cron-str">Cron Expression</label>
-                  <input type="text" id="cron-str" class="mc-input" placeholder="0 4 * * * (daily at 4AM)">
+                  <input type="text" id="cron-str" class="mc-input" value="0 4 * * *"
+                    placeholder="min hour day month weekday" oninput="markCronCustom()">
                 </div>
                 <div class="field">
                   <label class="field-lbl" for="cron-action">Action</label>

@@ -2279,3 +2279,87 @@ body.no-target .needs-target {
   min-height: 1.4em;
   text-align: center;
 }
+
+/* ===========================================================================
+   Console autocomplete
+   The list is anchored above the prompt the way the in-game command box does
+   it, so a long list grows upward and never covers what you are typing.
+   =========================================================================== */
+.cin-wrap {
+  position: relative;
+}
+
+.sg-box {
+  position: absolute;
+  bottom: 100%;
+  left: 0;
+  right: 0;
+  margin-bottom: var(--s1);
+  z-index: 40;
+  background: #0d0d0d;
+  border: 3px solid var(--btn-dark);
+  max-height: 260px;
+  overflow-y: auto;
+}
+
+.sg-hint {
+  padding: var(--s1) var(--s2);
+  font-size: var(--t-xs);
+  color: var(--mc-gray);
+  border-bottom: 1px solid #2a2a2a;
+  position: sticky;
+  top: 0;
+  background: #0d0d0d;
+}
+
+.sg-item {
+  display: flex;
+  align-items: baseline;
+  gap: var(--s2);
+  width: 100%;
+  padding: 3px var(--s2);
+  background: none;
+  border: none;
+  text-align: left;
+  cursor: pointer;
+  font-family: inherit;
+  font-size: var(--t-sm);
+  color: var(--mc-white);
+}
+
+.sg-item:hover {
+  background: #232323;
+}
+
+.sg-item.active {
+  background: #3a7a1a;
+}
+
+.sg-val {
+  color: var(--mc-green);
+}
+
+.sg-item.active .sg-val {
+  color: #fff;
+}
+
+.sg-arg {
+  color: var(--mc-gray);
+  font-size: var(--t-xs);
+  margin-left: auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sg-item.active .sg-arg {
+  color: #d8f0c8;
+}
+
+.sg-more {
+  padding: 3px var(--s2);
+  font-size: var(--t-xs);
+  color: var(--mc-gray);
+  font-style: italic;
+  border-top: 1px solid #2a2a2a;
+}
