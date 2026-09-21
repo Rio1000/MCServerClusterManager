@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sign in — Cluster Manager</title>
+  <link rel="stylesheet" href="style.css">
+  <script>
+    // Same pre-paint theme trick as index.html, so signing in at night does
+    // not flash the day palette.
+    try {
+      var t = localStorage.getItem('mc-theme');
+      if (t === 'dark' || t === 'light') document.documentElement.setAttribute('data-theme', t);
+    } catch (e) { /* storage blocked — fall back to the OS preference */ }
+  </script>
+</head>
+
+<body class="login-body">
+  <div id="toast-container" aria-live="polite"></div>
+
+  <div class="login-wrap">
+    <div class="mc-topbar login-bar">
+      <div class="grass-icon"></div>
+      <span class="mc-title">CLUSTER MANAGER</span>
+    </div>
+
+    <div class="inv-panel login-card">
+      <div class="inv-title"><span id="login-heading">Sign In</span></div>
+
+      <p class="card-hint" id="login-hint">Checking&hellip;</p>
+
+      <form id="login-form" onsubmit="submitLogin(event)" autocomplete="on">
+        <div class="field">
+          <label class="field-lbl" for="password">Password</label>
+          <input type="password" id="password" class="mc-input" autocomplete="current-password"
+            autofocus required>
+        </div>
+
+        <!-- Only shown during first-run setup -->
+        <div class="field" id="confirm-field" hidden>
+          <label class="field-lbl" for="confirm">Confirm password</label>
+          <input type="password" id="confirm" class="mc-input" autocomplete="new-password">
+        </div>
+
+        <button type="submit" class="mc-btn green block" id="login-btn">SIGN IN</button>
+        <div id="login-status" class="status-line"></div>
+      </form>
+    </div>
+  </div>
+
+  <script>
+    let needsSetup = false;
+    let minLength = 8;
+
+    async function initLogin() {
+      const res = await fetch('/api/auth/status').catch(() => null);
+      const d = res && res.ok ? await res.json().catch(() => ({})) : {};
+
+      if (d.authenticated) { location.replace('/'); return; }
+
+      minLength = d.min_length || 8;
+      needsSetup = !d.configured;
+
+      const heading = document.getElementById('login-heading');
+      const hint = document.getElementById('login-hint');
+      const btn = document.getElementById('login-btn');
+      const pw = document.getElementById('password');
+
+      if (needsSetup) {
+        heading.textContent = 'Create a Password';
+        hint.textContent = `No password is set yet. Pick one (at least ${minLength} characters) — `
+          + 'it is the only thing standing between this manager and whoever else can reach it.';
+        btn.textContent = 'SET PASSWORD';
+        pw.autocomplete = 'new-password';
+        document.getElementById('confirm-field').hidden = false;
+        document.getElementById('confirm').required = true;
+      } else {
+        heading.textContent = 'Sign In';
+        hint.textContent = 'This manager controls Docker containers, files and RCON. Sign in to continue.';
+        btn.textContent = 'SIGN IN';
+      }
+    }
+
+    function status(msg, cls) {
+      const el = document.getElementById('login-status');
+      el.innerHTML = msg ? `<span class="${cls || ''}">${msg}</span>` : '';
+    }
+
+    async function submitLogin(ev) {
+      ev.preventDefault();
+      const pw = document.getElementById('password').value;
+      const btn = document.getElementById('login-btn');
+
+      if (needsSetup) {
+        if (pw.length < minLength) {
+          status(`Password must be at least ${minLength} characters.`, 'err');
+          return;
+        }
+        if (pw !== document.getElementById('confirm').value) {
+          status('The two passwords do not match.', 'err');
+          return;
+        }
+      }
+
+      btn.disabled = true;
+      status('Working…');
+
+      const res = await fetch(needsSetup ? '/api/auth/setup' : '/api/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password: pw }),
+      }).catch(() => null);
+
+      btn.disabled = false;
+
+      if (!res) { status('Cannot reach the daemon.', 'err'); return; }
+      const d = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        status(d.detail || 'Sign in failed.', 'err');
+        document.getElementById('password').select();
+        return;
+      }
+      status(d.message || 'Signed in.', 'ok');
+      location.replace('/');
+    }
+
+    initLogin();
+  </script>
+</body>
+
+</html>

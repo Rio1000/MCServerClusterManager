@@ -133,6 +133,35 @@ function initTheme() {
 }
 
 // ---------------------------------------------------------------------------
+// Session guard
+//
+// The whole app is behind a session cookie, and the daemon answers 401 once it
+// lapses — which happens on every daemon restart, since sessions are in
+// memory. Wrapping fetch catches that for every caller at once, including the
+// 3s node poller, instead of leaving a page that quietly fails everything.
+// ---------------------------------------------------------------------------
+let sessionLost = false;
+
+function handleSessionLoss() {
+  if (sessionLost) return;
+  sessionLost = true;
+  location.replace('/login.html');
+}
+
+(function guardFetch() {
+  const original = window.fetch.bind(window);
+  window.fetch = async (input, init) => {
+    const res = await original(input, init);
+    // Only our own API speaks for our session; a 401 from Mojang or Modrinth
+    // must not bounce the user to a login screen.
+    const url = typeof input === 'string' ? input : (input && input.url) || '';
+    const sameOrigin = url.startsWith('/') || url.startsWith(location.origin);
+    if (res.status === 401 && sameOrigin) handleSessionLoss();
+    return res;
+  };
+})();
+
+// ---------------------------------------------------------------------------
 // Toast notification system
 // ---------------------------------------------------------------------------
 function toast(msg, type = 'info') {
@@ -231,7 +260,11 @@ function connectWS() {
     }
   };
 
-  ws.onclose = () => {
+  ws.onclose = (ev) => {
+    // 1008 is what the daemon sends when the socket carries no valid session.
+    // Reconnecting would just be refused again, so go and sign in instead.
+    if (ev.code === 1008) { handleSessionLoss(); return; }
+    if (sessionLost) return;
     console.warn('WebSocket closed – reconnecting in 5s');
     setTimeout(connectWS, 5000);
   };
@@ -2120,6 +2153,49 @@ async function deleteBackup(filename) {
   if (!data) return;
   toast(data.message, 'ok');
   loadBackups();
+}
+
+// ---------------------------------------------------------------------------
+// Auth
+//
+// The session is a cookie the daemon set, so there is nothing to hold here.
+// What this does handle is the other half: noticing when the session has gone
+// (expired, or the daemon restarted) and getting back to the login screen
+// instead of leaving a dead page that silently fails every request.
+// ---------------------------------------------------------------------------
+function toLogin() {
+  location.replace('/login.html');
+}
+
+async function signOut() {
+  await fetch('/api/auth/logout', { method: 'POST' }).catch(() => null);
+  toLogin();
+}
+
+async function changePassword() {
+  const cur = document.getElementById('pw-current');
+  const nw = document.getElementById('pw-new');
+  const confirmEl = document.getElementById('pw-confirm');
+  const hint = document.getElementById('pw-hint');
+  const fail = msg => {
+    hint.textContent = msg;
+    hint.className = 'save-hint dirty';
+  };
+
+  if (!cur.value) { fail('Enter your current password.'); return; }
+  if (nw.value !== confirmEl.value) { fail('The new passwords do not match.'); return; }
+
+  const data = await apiCall('/api/auth/change-password', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ current: cur.value, new: nw.value }),
+  });
+  if (!data) { fail('Password not changed.'); return; }
+
+  [cur, nw, confirmEl].forEach(el => { el.value = ''; });
+  hint.textContent = '[CHANGED]';
+  hint.className = 'save-hint saved';
+  setTimeout(() => { hint.textContent = ''; hint.className = 'save-hint'; }, 4000);
+  toast(data.message, 'ok');
 }
 
 // ---------------------------------------------------------------------------

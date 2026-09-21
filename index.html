@@ -34,6 +34,8 @@
       <span class="topbar-spacer"></span>
       <button id="btn-theme" class="mc-btn sm" onclick="toggleTheme()" aria-pressed="false"
         title="Switch theme">THEME</button>
+      <button id="btn-logout" class="mc-btn sm" onclick="signOut()"
+        title="Sign out of the manager">SIGN OUT</button>
       <span class="pill pill-off" id="status-pill">NO SERVER SELECTED</span>
     </div>
 
@@ -922,6 +924,30 @@
             </div>
           </div>
 
+          <div class="inv-panel">
+            <div class="inv-title"><span>Security</span></div>
+            <p class="card-hint">One password guards the whole manager. Changing it signs out
+              every other browser that is currently signed in.</p>
+            <div class="grid-auto">
+              <div class="field">
+                <label class="field-lbl" for="pw-current">Current password</label>
+                <input type="password" id="pw-current" class="mc-input" autocomplete="current-password">
+              </div>
+              <div class="field">
+                <label class="field-lbl" for="pw-new">New password</label>
+                <input type="password" id="pw-new" class="mc-input" autocomplete="new-password">
+              </div>
+              <div class="field">
+                <label class="field-lbl" for="pw-confirm">Confirm new password</label>
+                <input type="password" id="pw-confirm" class="mc-input" autocomplete="new-password">
+              </div>
+            </div>
+            <div class="save-bar">
+              <button class="mc-btn green" onclick="changePassword()">CHANGE PASSWORD</button>
+              <button class="mc-btn" onclick="signOut()">SIGN OUT</button>
+              <span id="pw-hint" class="save-hint"></span>
+            </div>
+          </div>
         </div>
 
       </div><!-- /mc-main -->

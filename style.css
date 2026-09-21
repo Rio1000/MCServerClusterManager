@@ -2242,3 +2242,40 @@ body.no-target .needs-target {
   color: var(--warn-ink);
 }
 
+/* ===========================================================================
+   Login screen
+   Served before any session exists, so style.css is in PUBLIC_PATHS and this
+   block has to stand on its own — no classes from the app shell behind it.
+   =========================================================================== */
+.login-body {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 100vh;
+  padding: var(--s4);
+  background: var(--app-bg-outer);
+}
+
+.login-wrap {
+  width: 100%;
+  max-width: 420px;
+}
+
+.login-bar {
+  margin-bottom: var(--s3);
+  justify-content: center;
+}
+
+.login-card .field {
+  margin-bottom: var(--s3);
+}
+
+.login-card .mc-input {
+  width: 100%;
+}
+
+.login-card .status-line {
+  margin-top: var(--s2);
+  min-height: 1.4em;
+  text-align: center;
+}

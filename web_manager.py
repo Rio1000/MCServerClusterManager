@@ -1,10 +1,13 @@
 import asyncio
 import collections
+import hashlib
+import hmac
 import json
 import os
 import re
 import psutil
 import datetime
+import secrets
 import shutil
 import socket
 import stat
@@ -19,7 +22,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import (FastAPI, WebSocket, Request, UploadFile, File, Form, Path,
                      HTTPException)
-from fastapi.responses import JSONResponse, FileResponse
+from fastapi.responses import JSONResponse, FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.websockets import WebSocketDisconnect
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -44,6 +47,17 @@ TEMPLATES_FILE = os.path.join(DATA_DIR, "_templates.json")
 AUDIT_LOG     = os.path.join(DATA_DIR, "_audit.log")
 SETTINGS_FILE = os.path.join(DATA_DIR, "_settings.json")
 PROP_HISTORY_DIR = os.path.join(DATA_DIR, "_prop_history")
+AUTH_FILE     = os.path.join(DATA_DIR, "_auth.json")
+
+# Sessions live in memory only, so a restart signs everyone out. That is the
+# safer default for a box that reboots rarely: nothing to steal off disk.
+SESSION_TTL      = 7 * 24 * 3600
+SESSION_COOKIE   = "mcscm_session"
+MIN_PASSWORD_LEN = 8
+
+# Set MCSCM_PASSWORD to provision the password without using the setup screen
+# (it is only consulted while no password file exists).
+BOOTSTRAP_PASSWORD = os.environ.get("MCSCM_PASSWORD", "")
 
 # How often the background sampler records container CPU/memory, and how many
 # samples it keeps per server. 15s x 720 ≈ 3 hours of history, in memory only —
@@ -92,6 +106,126 @@ def audit(action: str, target: str, detail: str = ""):
             f.write(line)
     except Exception:
         pass
+
+# ---------------------------------------------------------------------------
+# Authentication
+#
+# One admin password, PBKDF2-hashed on disk, exchanged for an in-memory
+# session cookie. There is no user table because there is one operator; what
+# this defends against is anything that can reach the port getting arbitrary
+# file writes, RCON and container control for free.
+#
+# Everything is stdlib: hashlib for the KDF, secrets for tokens.
+# ---------------------------------------------------------------------------
+PBKDF2_ITERATIONS = 240_000
+
+def _hash_password(password: str) -> str:
+    salt = secrets.token_bytes(16)
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, PBKDF2_ITERATIONS)
+    return f"pbkdf2_sha256${PBKDF2_ITERATIONS}${salt.hex()}${dk.hex()}"
+
+def _verify_password(password: str, stored: str) -> bool:
+    try:
+        algo, iters, salt_hex, want_hex = stored.split("$")
+        if algo != "pbkdf2_sha256":
+            return False
+        dk = hashlib.pbkdf2_hmac("sha256", password.encode(),
+                                 bytes.fromhex(salt_hex), int(iters))
+    except (ValueError, AttributeError):
+        return False
+    # Constant time — a timing side channel is cheap to avoid here.
+    return hmac.compare_digest(dk.hex(), want_hex)
+
+def _load_auth() -> dict:
+    if not os.path.exists(AUTH_FILE):
+        return {}
+    try:
+        with open(AUTH_FILE) as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+def _save_auth(data: dict) -> None:
+    # Written 0600 before any content lands in it, so the hash is never briefly
+    # world-readable.
+    fd = os.open(AUTH_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(data, f, indent=2)
+
+def _is_configured() -> bool:
+    return bool(_load_auth().get("password"))
+
+def _provision_from_env() -> None:
+    """Honour MCSCM_PASSWORD on boot, but never overwrite an existing password."""
+    if not BOOTSTRAP_PASSWORD or _is_configured():
+        return
+    if len(BOOTSTRAP_PASSWORD) < MIN_PASSWORD_LEN:
+        print(f"[auth] MCSCM_PASSWORD is shorter than {MIN_PASSWORD_LEN} characters — ignored.")
+        return
+    _save_auth({"password": _hash_password(BOOTSTRAP_PASSWORD), "created": time.time()})
+    print("[auth] Password provisioned from MCSCM_PASSWORD.")
+
+# --- Sessions --------------------------------------------------------------
+_sessions: dict[str, float] = {}        # token -> expires_at
+
+def _new_session() -> str:
+    _prune_sessions()
+    token = secrets.token_urlsafe(32)
+    _sessions[token] = time.time() + SESSION_TTL
+    return token
+
+def _prune_sessions() -> None:
+    now = time.time()
+    for token in [t for t, exp in _sessions.items() if exp <= now]:
+        _sessions.pop(token, None)
+
+def _session_valid(token: str | None) -> bool:
+    if not token:
+        return False
+    expires = _sessions.get(token)
+    if expires is None:
+        return False
+    if expires <= time.time():
+        _sessions.pop(token, None)
+        return False
+    return True
+
+def _set_session_cookie(response: JSONResponse, token: str) -> None:
+    # secure=False deliberately: this is served over plain http on a LAN or a
+    # Tailscale address, and a Secure cookie would simply never be sent.
+    response.set_cookie(SESSION_COOKIE, token, max_age=SESSION_TTL,
+                        httponly=True, samesite="lax", path="/")
+
+# --- Login throttling ------------------------------------------------------
+LOGIN_MAX_FAILURES = 8
+LOGIN_LOCKOUT      = 300
+
+_login_failures: dict[str, list[float]] = {}
+
+def _client_ip(request: Request) -> str:
+    return request.client.host if request.client else "unknown"
+
+def _login_locked(ip: str) -> int:
+    """Seconds remaining on a lockout, or 0."""
+    cutoff = time.time() - LOGIN_LOCKOUT
+    hits = [t for t in _login_failures.get(ip, []) if t > cutoff]
+    _login_failures[ip] = hits
+    if len(hits) < LOGIN_MAX_FAILURES:
+        return 0
+    return int(hits[0] + LOGIN_LOCKOUT - time.time()) + 1
+
+def _record_login_failure(ip: str) -> None:
+    _login_failures.setdefault(ip, []).append(time.time())
+
+# --- The gate --------------------------------------------------------------
+# Reachable signed out: the login screen and what it needs to render, plus the
+# auth endpoints themselves. Everything else requires a session. The middleware
+# and the endpoints are registered further down, once `app` exists.
+PUBLIC_PATHS = {
+    "/login.html", "/style.css", "/favicon.ico",
+    "/api/auth/status", "/api/auth/login", "/api/auth/setup",
+}
 
 # ---------------------------------------------------------------------------
 # Settings
@@ -218,6 +352,10 @@ async def lifespan(app: FastAPI):
     os.makedirs(DATA_DIR,   exist_ok=True)
     os.makedirs(BACKUP_DIR, exist_ok=True)
     os.makedirs(PROP_HISTORY_DIR, exist_ok=True)
+    _provision_from_env()
+    if not _is_configured():
+        print("[auth] No password set yet — the first visit to the web UI will ask "
+              "you to create one.")
     for j in _load_jobs_raw():
         try:
             scheduler.add_job(
@@ -242,6 +380,94 @@ async def lifespan(app: FastAPI):
 SYSTEM_JOB_IDS = {"_sys_metrics", "_sys_watchdog"}
 
 app = FastAPI(lifespan=lifespan)
+
+# ---------------------------------------------------------------------------
+# Auth gate + endpoints
+#
+# Registered here rather than beside the helpers above because both need `app`.
+# The middleware runs before every HTTP route, including the static mount, so
+# index.html and script.js are behind the password too.
+# ---------------------------------------------------------------------------
+@app.middleware("http")
+async def require_auth(request: Request, call_next):
+    path = request.url.path
+    if path in PUBLIC_PATHS or _session_valid(request.cookies.get(SESSION_COOKIE)):
+        return await call_next(request)
+    if path.startswith("/api/"):
+        return JSONResponse({"detail": "Not signed in."}, status_code=401)
+    # A page request: send the browser somewhere it can actually sign in.
+    return RedirectResponse("/login.html", status_code=302)
+
+@app.get("/api/auth/status")
+async def auth_status(request: Request):
+    return JSONResponse({
+        "configured":    _is_configured(),
+        "authenticated": _session_valid(request.cookies.get(SESSION_COOKIE)),
+        "min_length":    MIN_PASSWORD_LEN,
+    })
+
+@app.post("/api/auth/setup")
+async def auth_setup(request: Request):
+    """First-run password creation. Refuses once a password exists."""
+    if _is_configured():
+        raise HTTPException(409, "A password is already set.")
+    data = await request.json()
+    password = data.get("password", "")
+    if len(password) < MIN_PASSWORD_LEN:
+        raise HTTPException(400, f"Password must be at least {MIN_PASSWORD_LEN} characters.")
+    await asyncio.to_thread(_save_auth, {"password": _hash_password(password),
+                                         "created": time.time()})
+    audit("AUTH_SETUP", "system", f"from={_client_ip(request)}")
+    resp = JSONResponse({"message": "Password set. You are signed in."})
+    _set_session_cookie(resp, _new_session())
+    return resp
+
+@app.post("/api/auth/login")
+async def auth_login(request: Request):
+    ip = _client_ip(request)
+    wait = _login_locked(ip)
+    if wait:
+        raise HTTPException(429, f"Too many failed attempts. Try again in {wait}s.")
+    if not _is_configured():
+        raise HTTPException(409, "No password is set yet.")
+    data = await request.json()
+    stored = _load_auth().get("password", "")
+    if not await asyncio.to_thread(_verify_password, data.get("password", ""), stored):
+        _record_login_failure(ip)
+        audit("AUTH_FAIL", "system", f"from={ip}")
+        raise HTTPException(401, "Incorrect password.")
+    _login_failures.pop(ip, None)
+    audit("AUTH_LOGIN", "system", f"from={ip}")
+    resp = JSONResponse({"message": "Signed in."})
+    _set_session_cookie(resp, _new_session())
+    return resp
+
+@app.post("/api/auth/logout")
+async def auth_logout(request: Request):
+    _sessions.pop(request.cookies.get(SESSION_COOKIE) or "", None)
+    resp = JSONResponse({"message": "Signed out."})
+    resp.delete_cookie(SESSION_COOKIE, path="/")
+    return resp
+
+@app.post("/api/auth/change-password")
+async def auth_change_password(request: Request):
+    data = await request.json()
+    current, new = data.get("current", ""), data.get("new", "")
+    stored = _load_auth().get("password", "")
+    if not await asyncio.to_thread(_verify_password, current, stored):
+        audit("AUTH_CHANGE_FAIL", "system", f"from={_client_ip(request)}")
+        raise HTTPException(401, "Current password is incorrect.")
+    if len(new) < MIN_PASSWORD_LEN:
+        raise HTTPException(400, f"New password must be at least {MIN_PASSWORD_LEN} characters.")
+    await asyncio.to_thread(_save_auth, {"password": _hash_password(new),
+                                         "created": time.time()})
+    # Every other session is now stale — changing the password should kick out
+    # whoever else was signed in with the old one.
+    keep = request.cookies.get(SESSION_COOKIE)
+    for token in [t for t in _sessions if t != keep]:
+        _sessions.pop(token, None)
+    audit("AUTH_CHANGE", "system", f"from={_client_ip(request)}")
+    return JSONResponse({"message": "Password changed. Other sessions were signed out."})
 
 # ---------------------------------------------------------------------------
 # Shared helpers
@@ -2944,6 +3170,13 @@ async def debug_disk(name: str = Path(...)):
 # ---------------------------------------------------------------------------
 @app.websocket("/ws")
 async def ws_endpoint(websocket: WebSocket):
+    # HTTP middleware does not run for websockets, so the session cookie has to
+    # be checked here. Without this the socket would hand out live logs and
+    # RCON execution to anyone who could open it.
+    if not _session_valid(websocket.cookies.get(SESSION_COOKIE)):
+        await websocket.close(code=1008)    # policy violation
+        return
+
     await websocket.accept()
     active_log_task: asyncio.Task | None = None
     connected = True          # shared flag — set False the moment the socket closes
