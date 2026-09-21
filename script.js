@@ -11,14 +11,16 @@ let currentPlayerTarget = "";
 
 // Single source of truth for all panels (drives sw() deactivation)
 const PANELS = [
-  'instances', 'overview', 'console', 'players',
+  'instances', 'cluster', 'overview', 'console', 'players',
   'properties', 'world', 'files', 'upload', 'mods', 'debug', 'automation'
 ];
 
-// Everything except Instances needs a target, and the sidebar hides those
-// entries until one is picked. sw() still checks, so a stale deep link or a
-// server deleted out from under the user cannot land on an empty panel.
-const TARGET_PANELS = new Set(PANELS.filter(p => p !== 'instances'));
+// Panels that work with no server selected. Everything else needs a target,
+// and the sidebar hides those entries until one is picked. sw() still checks,
+// so a stale deep link or a server deleted out from under the user cannot land
+// on an empty panel.
+const GLOBAL_PANELS = new Set(['instances', 'cluster']);
+const TARGET_PANELS = new Set(PANELS.filter(p => !GLOBAL_PANELS.has(p)));
 
 const WORLD_KEYS = [
   'level-name', 'level-seed', 'level-type', 'allow-nether', 'max-build-height',
@@ -170,6 +172,7 @@ document.addEventListener('DOMContentLoaded', () => {
   renderRconCommands();
   renderModalTabs();
   initTheme();
+  applyConsoleNoiseMode();
   applyTargetGate();
 });
 
@@ -209,30 +212,22 @@ function connectWS() {
       document.getElementById('stat-players').textContent = `${players.length}/${maxPlayers}`;
       document.getElementById('p-count-lbl').textContent = `Online: ${players.length} / ${maxPlayers}`;
 
-      const pListEl = document.getElementById('player-list');
-      pListEl.innerHTML = players.length === 0
-        ? `<div class="empty">No players currently online.</div>`
-        : players.map(p => `
-            <div class="p-row">
-              <div class="p-head"></div>
-              <div class="p-name">${escapeHtml(p)}</div>
-              <button class="mc-btn sm" onclick="showPlayerData('${escapeHtml(p)}')">NBT</button>
-            </div>`).join('');
+      renderPlayerRows(players);
     }
 
     // Player NBT
     if (data.type === 'player_data') {
-      document.getElementById('modal-pdata').textContent = data.data;
+      renderPlayerData(data.data);
     }
 
     // Docker log lines
     if (data.type === 'docker_log') {
-      logTerm(data.data);
+      logContainerLine(data.data);
     }
 
     // Console RCON response (fallback if not streamed via log)
     if (data.type === 'console_response' && data.stdout) {
-      data.stdout.split('\n').forEach(line => logTerm(line));
+      data.stdout.split('\n').forEach(line => logContainerLine(line));
     }
   };
 
@@ -292,19 +287,190 @@ function setBar(barId, lblId, pct) {
 // ---------------------------------------------------------------------------
 // Console terminal
 // ---------------------------------------------------------------------------
-function logTerm(msg, isErr = false) {
+
+// Housekeeping chatter the server emits on its own — the stats/player pollers
+// open an RCON connection every few seconds and each one logs a thread start
+// and shutdown, which buries the lines that actually came from the game.
+const CONSOLE_NOISE = [
+  /\[RCON (?:Listener|Client)[^\]]*\]:\s*Thread RCON Client .*(?:started|shutting down)/i,
+  /\[Query Listener[^\]]*\]:\s*Thread Query Listener started/i,
+  /Thread RCON Client .*(?:started|shutting down)\s*$/i
+];
+
+// Muted lines stay in the DOM so flipping the toggle reveals the backlog.
+const CONSOLE_MAX_LINES = 2000;
+let hideConsoleNoise = localStorage.getItem('mc-hide-console-noise') !== 'false';
+
+function isConsoleNoise(line) {
+  return CONSOLE_NOISE.some(re => re.test(line));
+}
+
+function consoleLevel(msg, isErr) {
+  if (isErr || /\b(ERROR|FATAL|SEVERE)\b/.test(msg)) return 'error';
+  if (/\bWARN(?:ING)?\b/.test(msg)) return 'warn';
+  return 'info';
+}
+
+const LEVEL_COLOR = { error: '#ff5555', warn: '#ffff55', info: '#55ff55', noise: '#6d8d6d' };
+
+function logTerm(msg, isErr = false, isNoise = false) {
   const el = document.getElementById('console-log');
   if (!el) return;
+  const level = consoleLevel(msg, isErr);
   const d = document.createElement('div');
-  d.style.color = isErr ? '#ff5555' : '#55ff55';
-  d.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+  d.className = isNoise ? 'term-line term-noise' : 'term-line';
+  d.dataset.level = level;
+  d.style.color = level === 'info' && isNoise ? LEVEL_COLOR.noise : LEVEL_COLOR[level];
+  // Server lines already carry their own clock — don't stamp them twice.
+  d.textContent = /^\[\d{1,2}:\d{2}:\d{2}\]/.test(msg)
+    ? msg
+    : `[${new Date().toLocaleTimeString()}] ${msg}`;
+  applyFilterToLine(d);
   el.appendChild(d);
+
+  while (el.childElementCount > CONSOLE_MAX_LINES) el.removeChild(el.firstElementChild);
   el.scrollTop = el.scrollHeight;
+  updateNoiseCount();
+  updateFilterCount();
+}
+
+// ---------------------------------------------------------------------------
+// Console filtering
+//
+// Search and severity hide lines with a class rather than dropping them, so
+// widening the filter brings the backlog straight back — same trick as the
+// noise toggle, and the two compose.
+// ---------------------------------------------------------------------------
+const LEVEL_RANK = { info: 0, warn: 1, error: 2 };
+
+function consoleFilterState() {
+  const search = (document.getElementById('console-search')?.value || '').trim().toLowerCase();
+  const level = document.getElementById('console-level')?.value || 'all';
+  return { search, minRank: level === 'error' ? 2 : level === 'warn' ? 1 : 0 };
+}
+
+function applyFilterToLine(node, state) {
+  const { search, minRank } = state || consoleFilterState();
+  const levelOk = LEVEL_RANK[node.dataset.level || 'info'] >= minRank;
+  const textOk = !search || node.textContent.toLowerCase().includes(search);
+  node.classList.toggle('term-filtered', !(levelOk && textOk));
+}
+
+function applyConsoleFilter() {
+  const el = document.getElementById('console-log');
+  if (!el) return;
+  const state = consoleFilterState();
+  el.querySelectorAll('.term-line').forEach(node => applyFilterToLine(node, state));
+  updateFilterCount();
+}
+
+function updateFilterCount() {
+  const el = document.getElementById('console-log');
+  const lbl = document.getElementById('console-filter-count');
+  if (!el || !lbl) return;
+  const { search, minRank } = consoleFilterState();
+  if (!search && !minRank) { lbl.textContent = ''; return; }
+  const total = el.querySelectorAll('.term-line').length;
+  const hit = el.querySelectorAll('.term-line:not(.term-filtered)').length;
+  lbl.textContent = `${hit} / ${total} shown`;
+}
+
+function downloadConsole() {
+  const el = document.getElementById('console-log');
+  if (!el || !el.childElementCount) { toast('Nothing in the console to save.', 'error'); return; }
+  // What you see is what you get: muted and filtered-out lines stay out.
+  const lines = [...el.querySelectorAll('.term-line')]
+    .filter(n => n.offsetParent !== null)
+    .map(n => n.textContent);
+  if (!lines.length) { toast('Every line is filtered out.', 'error'); return; }
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+  const blob = new Blob([lines.join('\n') + '\n'], { type: 'text/plain' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `${activeServer || 'console'}-${stamp}.log`;
+  a.click();
+  URL.revokeObjectURL(url);
+  toast(`Saved ${lines.length} line(s).`, 'ok');
+}
+
+// Container log lines are the only ones eligible for muting — anything the
+// manager itself prints always shows.
+function logContainerLine(line) {
+  logTerm(line, false, isConsoleNoise(line));
+}
+
+function applyConsoleNoiseMode() {
+  const el = document.getElementById('console-log');
+  const btn = document.getElementById('console-noise-btn');
+  if (el) el.classList.toggle('hide-noise', hideConsoleNoise);
+  if (btn) btn.textContent = hideConsoleNoise ? 'SHOW NOISE' : 'HIDE NOISE';
+  updateNoiseCount();
+}
+
+function toggleConsoleNoise() {
+  hideConsoleNoise = !hideConsoleNoise;
+  localStorage.setItem('mc-hide-console-noise', hideConsoleNoise ? 'true' : 'false');
+  applyConsoleNoiseMode();
+}
+
+function updateNoiseCount() {
+  const el = document.getElementById('console-log');
+  const lbl = document.getElementById('console-muted');
+  if (!el || !lbl) return;
+  const muted = el.querySelectorAll('.term-noise').length;
+  lbl.textContent = hideConsoleNoise && muted ? `${muted} line${muted === 1 ? '' : 's'} muted` : '';
 }
 
 function clearConsole() {
   const el = document.getElementById('console-log');
   if (el) el.innerHTML = '';
+  updateNoiseCount();
+}
+
+// ---------------------------------------------------------------------------
+// Command history — up/down through what was sent, per browser, across reloads
+// ---------------------------------------------------------------------------
+const CMD_HISTORY_KEY = 'mc-cmd-history';
+const CMD_HISTORY_MAX = 100;
+
+let cmdHistory = loadCmdHistory();
+let cmdCursor = cmdHistory.length;   // one past the end == the live input
+let cmdDraft = '';                   // what was typed before arrowing away
+
+function loadCmdHistory() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(CMD_HISTORY_KEY) || '[]');
+    return Array.isArray(raw) ? raw.filter(x => typeof x === 'string') : [];
+  } catch (e) {
+    return [];
+  }
+}
+
+function pushCmdHistory(cmd) {
+  // Repeating the last command should not grow the list.
+  if (cmdHistory[cmdHistory.length - 1] !== cmd) cmdHistory.push(cmd);
+  if (cmdHistory.length > CMD_HISTORY_MAX) cmdHistory = cmdHistory.slice(-CMD_HISTORY_MAX);
+  cmdCursor = cmdHistory.length;
+  cmdDraft = '';
+  try {
+    localStorage.setItem(CMD_HISTORY_KEY, JSON.stringify(cmdHistory));
+  } catch (e) { /* private mode — history just won't survive the reload */ }
+}
+
+function consoleKeydown(ev) {
+  const inp = ev.target;
+  if (ev.key === 'Enter') { sendTerminalCommand(); return; }
+  if (ev.key !== 'ArrowUp' && ev.key !== 'ArrowDown') return;
+  if (!cmdHistory.length) return;
+  ev.preventDefault();
+
+  if (cmdCursor === cmdHistory.length) cmdDraft = inp.value;
+  cmdCursor += ev.key === 'ArrowUp' ? -1 : 1;
+  cmdCursor = Math.max(0, Math.min(cmdCursor, cmdHistory.length));
+  inp.value = cmdCursor === cmdHistory.length ? cmdDraft : cmdHistory[cmdCursor];
+  // Park the caret at the end, or typing lands in the middle of the recalled line.
+  requestAnimationFrame(() => inp.setSelectionRange(inp.value.length, inp.value.length));
 }
 
 function sendTerminalCommand() {
@@ -314,6 +480,7 @@ function sendTerminalCommand() {
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({ method: 'docker:exec/command', target: activeServer, command: val }));
     logTerm(`> ${val}`);
+    pushCmdHistory(val);
     inp.value = '';
   }
 }
@@ -343,10 +510,13 @@ function sw(id, el) {
   if (main) main.scrollTop = 0;
 
   // Auto-fetch on panel open
-  if (id === 'automation') { loadBackups(); loadJobs(); }
-  if (id === 'mods') { loadInstalledAddons(); refreshPackwizStatus(); }
-  if (id === 'players') { requestPlayerList(); }
+  if (id === 'automation') { loadBackups(); loadJobs(); loadSettings(); }
+  if (id === 'mods') { loadInstalledAddons(); refreshPackwizStatus(); seedModrinthFilters(); }
+  if (id === 'players') { requestPlayerList(); loadAccessList(); }
   if (id === 'files') { fmReload(); }
+  if (id === 'cluster') { loadClusterMetrics(); }
+  if (id === 'overview') { loadServerMetrics(); }
+  if (id === 'properties') { loadPropHistory(); }
   // The debug snapshot shells out to docker several times, so it is fetched
   // once per target and then only on request.
   if (id === 'debug' && !debugData) { loadDebug(); loadDebugLogs(); }
@@ -449,6 +619,8 @@ function setServerTarget(name, status) {
   loadInstalledAddons();
   fmResetForServer();
   debugResetForServer();
+  accessResetForServer();
+  propHistoryResetForServer();
 
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({ method: 'docker:logs/subscribe', target: name }));
@@ -457,7 +629,7 @@ function setServerTarget(name, status) {
   }
 
   // Reset console and subscribe to new container logs
-  document.getElementById('console-log').innerHTML = '';
+  clearConsole();
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({ method: 'docker:logs/subscribe', target: name }));
   }
@@ -865,6 +1037,390 @@ function requestPlayerList() {
 }
 
 // ---------------------------------------------------------------------------
+// Player moderation
+//
+// Rows carry the player name in a data attribute and the list delegates
+// clicks, so a name never has to survive a round trip through an interpolated
+// onclick handler.
+// ---------------------------------------------------------------------------
+// Confirmed actions are the ones that visibly hit someone or hand out power.
+const PLAYER_ROW_ACTIONS = [
+  { act: 'nbt',              label: 'NBT',   cls: '' },
+  { act: 'kick',            label: 'KICK',  cls: 'orange', confirm: 'Kick' },
+  { act: 'ban',             label: 'BAN',   cls: 'red',    confirm: 'Ban', reason: true },
+  { act: 'op',              label: 'OP',    cls: '',       confirm: 'Grant operator to' },
+  { act: 'whitelist_add',   label: 'WL+',   cls: '' },
+];
+
+const ACTION_VERB = {
+  kick: 'Kicked', ban: 'Banned', pardon: 'Unbanned', op: 'Opped', deop: 'De-opped',
+  whitelist_add: 'Whitelisted', whitelist_remove: 'Removed from whitelist',
+  gamemode: 'Gamemode set for', kill: 'Killed',
+};
+
+function renderPlayerRows(players) {
+  const el = document.getElementById('player-list');
+  if (!el) return;
+  el.innerHTML = players.length === 0
+    ? `<div class="empty">No players currently online.</div>`
+    : players.map(p => `
+        <div class="p-row" data-player="${escapeHtml(p)}">
+          <div class="p-head"></div>
+          <div class="p-name">${escapeHtml(p)}</div>
+          <div class="p-acts">
+            ${PLAYER_ROW_ACTIONS.map(a =>
+              `<button class="mc-btn sm ${a.cls}" data-act="${a.act}">${a.label}</button>`).join('')}
+          </div>
+        </div>`).join('');
+}
+
+async function playerAction(player, action, arg = '') {
+  if (!activeServer) { toast('Select a server first.', 'error'); return; }
+  const data = await apiCall(`/api/server/${activeServer}/player/action`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ player, action, arg }),
+  });
+  if (!data) return;
+  logTerm(`> ${data.command}`);
+  if (data.message) logTerm(data.message);
+  toast(`${ACTION_VERB[action] || action} ${player}.`, 'ok');
+  requestPlayerList();
+  // A ban or whitelist change is only visible once the list is re-read.
+  if (['ban', 'pardon', 'op', 'deop', 'whitelist_add', 'whitelist_remove'].includes(action)) {
+    loadAccessList();
+  }
+}
+
+function handlePlayerRowClick(ev) {
+  const hit = ev.target.closest('[data-act]');
+  if (!hit) return;
+  const row = hit.closest('.p-row');
+  if (!row) return;
+  const player = row.dataset.player;
+  const act = hit.dataset.act;
+
+  if (act === 'nbt') { showPlayerData(player); return; }
+
+  const spec = PLAYER_ROW_ACTIONS.find(a => a.act === act);
+  if (spec && spec.confirm && !confirm(`${spec.confirm} ${player}?`)) return;
+  const reason = spec && spec.reason ? (prompt(`Reason for banning ${player}:`, '') ?? '') : '';
+  playerAction(player, act, reason);
+}
+
+// The reason box only means something for kick and ban; gamemode reuses it as
+// the mode, so the placeholder has to say which one is being asked for.
+function syncModArg() {
+  const action = document.getElementById('mod-action').value;
+  const arg = document.getElementById('mod-arg');
+  if (action === 'gamemode') {
+    arg.placeholder = 'survival | creative | adventure | spectator';
+    arg.disabled = false;
+  } else if (action === 'kick' || action === 'ban') {
+    arg.placeholder = 'Reason (optional)';
+    arg.disabled = false;
+  } else {
+    arg.placeholder = 'Not used for this action';
+    arg.value = '';
+    arg.disabled = true;
+  }
+}
+
+function runModAction() {
+  const player = document.getElementById('mod-player').value.trim();
+  const action = document.getElementById('mod-action').value;
+  const arg = document.getElementById('mod-arg').value.trim();
+  if (!player) { toast('Enter a player name.', 'error'); return; }
+  playerAction(player, action, arg);
+}
+
+// ---------------------------------------------------------------------------
+// Access lists — whitelist / ops / bans
+// ---------------------------------------------------------------------------
+const ACCESS_KINDS = [
+  { id: 'whitelist',      label: 'Whitelist' },
+  { id: 'ops',            label: 'Operators' },
+  { id: 'banned-players', label: 'Banned Players' },
+  { id: 'banned-ips',     label: 'Banned IPs' },
+];
+
+let accessKind = 'whitelist';
+
+function renderAccessTabs() {
+  const el = document.getElementById('access-tabs');
+  if (!el) return;
+  el.innerHTML = ACCESS_KINDS.map(k =>
+    `<button class="mc-btn sm tab${k.id === accessKind ? ' active' : ''}"
+       data-kind="${k.id}" onclick="switchAccessKind('${k.id}')">${k.label}</button>`).join('');
+}
+
+function switchAccessKind(kind) {
+  accessKind = kind;
+  const val = document.getElementById('access-value');
+  const reason = document.getElementById('access-reason');
+  if (val) val.placeholder = kind === 'banned-ips' ? 'IP address' : 'Player name';
+  if (reason) reason.disabled = !kind.startsWith('banned');
+  renderAccessTabs();
+  loadAccessList();
+}
+
+function accessResetForServer() {
+  const el = document.getElementById('access-list');
+  if (el) el.innerHTML = '<div class="empty">Loading…</div>';
+  if (document.getElementById('panel-players').classList.contains('active')) loadAccessList();
+}
+
+async function loadAccessList() {
+  if (!activeServer) return;
+  renderAccessTabs();
+  const el = document.getElementById('access-list');
+  if (!el) return;
+  el.innerHTML = '<div class="empty">Reading the volume…</div>';
+
+  const data = await apiCall(`/api/server/${activeServer}/access/${accessKind}`);
+  if (!data) { el.innerHTML = '<div class="empty err">Could not read that list.</div>'; return; }
+
+  const mode = document.getElementById('access-mode');
+  if (mode) {
+    mode.textContent = data.running ? 'live via RCON' : 'offline — editing the file';
+  }
+
+  const rows = data.entries || [];
+  el.innerHTML = !rows.length
+    ? `<div class="empty">Nothing in ${escapeHtml(data.file || accessKind)}.</div>`
+    : rows.map(r => {
+        const main = r.name || r.ip || '(unnamed)';
+        const bits = [];
+        if (r.uuid) bits.push(r.uuid);
+        if (r.level !== undefined) bits.push(`level ${r.level}`);
+        if (r.reason) bits.push(r.reason);
+        if (r.expires && r.expires !== 'forever') bits.push(`expires ${r.expires}`);
+        return `
+          <div class="list-row" data-value="${escapeHtml(main)}">
+            <div class="row-main">
+              <div>${escapeHtml(main)}</div>
+              ${bits.length ? `<div class="row-sub mono">${escapeHtml(bits.join(' · '))}</div>` : ''}
+            </div>
+            <button class="mc-btn red sm" data-act="access-remove">REMOVE</button>
+          </div>`;
+      }).join('');
+}
+
+async function accessEdit(op, value, reason = '') {
+  if (!activeServer) { toast('Select a server first.', 'error'); return; }
+  const data = await apiCall(`/api/server/${activeServer}/access/${accessKind}`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ op, value, reason }),
+  });
+  if (!data) return;
+  logTerm(data.message);
+  toast(data.message, 'ok');
+  loadAccessList();
+}
+
+function accessAdd() {
+  const val = document.getElementById('access-value');
+  const reason = document.getElementById('access-reason');
+  const value = val.value.trim();
+  if (!value) { toast('Enter a name or IP first.', 'error'); return; }
+  accessEdit('add', value, reason.value.trim());
+  val.value = '';
+}
+
+// ---------------------------------------------------------------------------
+// Metrics charts
+//
+// Hand-rolled SVG rather than a charting library: the page ships no bundler
+// and these are line charts over a few hundred points. The viewBox is a fixed
+// grid stretched by CSS, so paths are laid out in chart units and strokes are
+// kept honest with non-scaling-stroke.
+// ---------------------------------------------------------------------------
+const CHART_W = 600;
+
+function niceMax(values, floor = 1) {
+  const peak = Math.max(floor, ...values);
+  // Round up to 1/2/5 x 10^n so the top gridline reads as a round number.
+  const mag = Math.pow(10, Math.floor(Math.log10(peak)));
+  const step = peak / mag <= 1 ? 1 : peak / mag <= 2 ? 2 : peak / mag <= 5 ? 5 : 10;
+  return step * mag;
+}
+
+function chartPaths(samples, key, h, maxVal) {
+  const n = samples.length;
+  const xAt = i => (n < 2 ? CHART_W : (i / (n - 1)) * CHART_W);
+  const yAt = v => h - Math.min(v / maxVal, 1) * h;
+
+  // A null sample means the server was down — lift the pen so the line breaks
+  // instead of drawing a straight run across the gap.
+  const segments = [];
+  let current = [];
+  samples.forEach((s, i) => {
+    const v = s[key];
+    if (v === null || v === undefined) {
+      if (current.length) segments.push(current);
+      current = [];
+      return;
+    }
+    current.push([xAt(i), yAt(v)]);
+  });
+  if (current.length) segments.push(current);
+
+  const line = segments.map(seg =>
+    seg.map(([x, y], i) => `${i ? 'L' : 'M'}${x.toFixed(1)},${y.toFixed(1)}`).join('')).join(' ');
+  const fill = segments.filter(s => s.length > 1).map(seg => {
+    const pts = seg.map(([x, y], i) => `${i ? 'L' : 'M'}${x.toFixed(1)},${y.toFixed(1)}`).join('');
+    return `${pts}L${seg[seg.length - 1][0].toFixed(1)},${h}L${seg[0][0].toFixed(1)},${h}Z`;
+  }).join(' ');
+  return { line, fill, points: segments.reduce((a, s) => a + s.length, 0) };
+}
+
+function renderChart(samples, key, opts = {}) {
+  const { height = 60, color = 'var(--mc-green)', unit = '', floor = 1 } = opts;
+  const values = samples.map(s => s[key]).filter(v => v !== null && v !== undefined);
+  if (!values.length) {
+    return `<div class="chart-empty">No samples yet${unit ? ` for ${escapeHtml(unit)}` : ''}.</div>`;
+  }
+  const max = niceMax(values, floor);
+  const { line, fill } = chartPaths(samples, key, height, max);
+  const id = `g${Math.random().toString(36).slice(2, 8)}`;
+  return `
+    <svg class="chart" viewBox="0 0 ${CHART_W} ${height}" preserveAspectRatio="none"
+         role="img" aria-label="${escapeHtml(unit)} over time">
+      <defs>
+        <linearGradient id="${id}" x1="0" x2="0" y1="0" y2="1">
+          <stop offset="0%" stop-color="${color}" stop-opacity="0.35"/>
+          <stop offset="100%" stop-color="${color}" stop-opacity="0"/>
+        </linearGradient>
+      </defs>
+      <line class="chart-grid" x1="0" y1="${height / 2}" x2="${CHART_W}" y2="${height / 2}"/>
+      <path d="${fill}" fill="url(#${id})" stroke="none"/>
+      <path d="${line}" fill="none" stroke="${color}" stroke-width="1.5"
+            vector-effect="non-scaling-stroke" stroke-linejoin="round"/>
+    </svg>`;
+}
+
+function seriesSummary(samples, key, unit, digits = 0) {
+  const values = samples.map(s => s[key]).filter(v => v !== null && v !== undefined);
+  if (!values.length) return { now: '—', avg: '—', max: '—' };
+  const fmt = v => `${v.toFixed(digits)}${unit}`;
+  return {
+    now: fmt(values[values.length - 1]),
+    avg: fmt(values.reduce((a, b) => a + b, 0) / values.length),
+    max: fmt(Math.max(...values)),
+  };
+}
+
+function sparkBlock(title, samples, key, opts) {
+  const s = seriesSummary(samples, key, opts.unit || '', opts.digits || 0);
+  return `
+    <div class="spark-block">
+      <div class="spark-head">
+        <span class="spark-title">${escapeHtml(title)}</span>
+        <span class="spark-stats">
+          <span>now <b>${escapeHtml(s.now)}</b></span>
+          <span>avg ${escapeHtml(s.avg)}</span>
+          <span>peak ${escapeHtml(s.max)}</span>
+        </span>
+      </div>
+      ${renderChart(samples, key, opts)}
+    </div>`;
+}
+
+// ---------------------------------------------------------------------------
+// Overview history (active server)
+// ---------------------------------------------------------------------------
+async function loadServerMetrics() {
+  if (!activeServer) return;
+  const box = document.getElementById('hist-spark');
+  if (!box) return;
+  const minutes = document.getElementById('hist-range')?.value || '60';
+  const data = await apiCall(
+    `/api/server/${activeServer}/metrics?minutes=${encodeURIComponent(minutes)}`);
+  if (!data) { box.innerHTML = '<div class="empty err">Could not load history.</div>'; return; }
+
+  const samples = data.samples || [];
+  if (!samples.length) {
+    box.innerHTML = `<div class="empty">Nothing sampled yet — the daemon records every
+      ${data.interval || 15}s, so check back shortly.</div>`;
+    return;
+  }
+  const hasPlayers = samples.some(s => s.players !== null && s.players !== undefined);
+  box.innerHTML = [
+    sparkBlock('Container CPU', samples, 'cpu', { unit: '%', digits: 1, color: 'var(--mc-green)', floor: 10 }),
+    sparkBlock('Container Memory', samples, 'mem_mb', { unit: ' MB', digits: 0, color: 'var(--mc-cyan)', floor: 64 }),
+    hasPlayers
+      ? sparkBlock('Players Online', samples, 'players', { unit: '', digits: 0, color: 'var(--mc-yellow)', floor: 4 })
+      : `<div class="spark-block"><div class="spark-head"><span class="spark-title">Players Online</span></div>
+         <div class="chart-empty">Recorded while the Players panel is polling — open it to start
+         building this series.</div></div>`,
+  ].join('');
+}
+
+// ---------------------------------------------------------------------------
+// Cluster load (every server)
+// ---------------------------------------------------------------------------
+let clusterMetrics = null;
+
+async function loadClusterMetrics() {
+  const box = document.getElementById('cluster-graphs');
+  if (!box) return;
+  box.innerHTML = '<div class="empty">Reading samples…</div>';
+  const minutes = document.getElementById('cluster-range')?.value || '60';
+  const data = await apiCall(`/api/metrics?minutes=${encodeURIComponent(minutes)}`);
+  if (!data) { box.innerHTML = '<div class="empty err">Could not load cluster metrics.</div>'; return; }
+  clusterMetrics = data;
+  renderClusterMetrics();
+}
+
+function renderClusterMetrics() {
+  const box = document.getElementById('cluster-graphs');
+  if (!box || !clusterMetrics) return;
+  const metric = document.getElementById('cluster-metric')?.value || 'cpu';
+  const isCpu = metric === 'cpu';
+  const opts = isCpu
+    ? { unit: '%', digits: 1, color: 'var(--mc-green)', floor: 10, height: 70 }
+    : { unit: ' MB', digits: 0, color: 'var(--mc-cyan)', floor: 64, height: 70 };
+
+  const servers = clusterMetrics.servers || [];
+  if (!servers.length) {
+    box.innerHTML = '<div class="empty">No managed containers found.</div>';
+    return;
+  }
+
+  box.innerHTML = servers.map(s => {
+    const samples = s.samples || [];
+    const running = /^up/i.test(s.status || '');
+    const summary = seriesSummary(samples, metric, opts.unit, opts.digits);
+    const body = samples.length
+      ? renderChart(samples, metric, opts)
+      : `<div class="chart-empty">${running
+          ? 'Waiting for the first sample.'
+          : 'Not running — nothing to sample.'}</div>`;
+    return `
+      <div class="graph-card${running ? '' : ' dim'}">
+        <div class="graph-head">
+          <button class="graph-name" data-target="${escapeHtml(s.server)}"
+            title="Make this the active instance">${escapeHtml(s.server)}</button>
+          <span class="pill ${running ? 'pill-on' : 'pill-off'}">${running ? 'UP' : 'DOWN'}</span>
+          <span class="spark-stats">
+            <span>now <b>${escapeHtml(summary.now)}</b></span>
+            <span>avg ${escapeHtml(summary.avg)}</span>
+            <span>peak ${escapeHtml(summary.max)}</span>
+          </span>
+        </div>
+        ${body}
+      </div>`;
+  }).join('');
+
+  const hint = document.getElementById('cluster-hint');
+  if (hint) {
+    const total = servers.reduce((a, s) => a + (s.samples || []).length, 0);
+    hint.textContent = `${servers.length} instance(s), ${total} sample(s) over the last `
+      + `${clusterMetrics.minutes} minutes — one docker stats call every `
+      + `${clusterMetrics.interval}s, no RCON involved.`;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Player NBT modal
 // ---------------------------------------------------------------------------
 const NBT_CATEGORIES = [
@@ -906,6 +1462,251 @@ function fetchCategory(cat) {
 function closeModal() {
   document.getElementById('player-modal').classList.remove('active');
   document.getElementById('modal-pdata').textContent = '';
+  nbtRaw = '';
+}
+
+// ---------------------------------------------------------------------------
+// SNBT
+//
+// `data get entity` answers with stringified NBT on one line — a few thousand
+// characters of nested compounds with no whitespace, which is unreadable as
+// text. This parses it into a tree so the modal can render it properly, and
+// falls back to the raw string if anything unexpected turns up.
+//
+// Grammar: compounds {k: v}, lists [v, v], typed arrays [I; 1, 2], quoted and
+// bare strings, and numbers carrying a type suffix (0b, 3s, 1.5f, 20.0d, 9L).
+// ---------------------------------------------------------------------------
+const SNBT_PREFIX_RE = /^.*?\bhas the following entity data:\s*/s;
+const SNBT_BARE = /[A-Za-z0-9._+\-]/;
+const SNBT_NUMBER = /^[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?([bslfdBSLFD])?$/;
+
+function parseSNBT(text) {
+  let i = 0;
+  const s = text;
+
+  const fail = msg => { throw new Error(`${msg} at offset ${i}`); };
+  const ws = () => { while (i < s.length && /\s/.test(s[i])) i++; };
+
+  function parseQuoted() {
+    const quote = s[i++];
+    let out = '';
+    while (i < s.length) {
+      const c = s[i++];
+      if (c === '\\') { out += s[i++] ?? ''; continue; }
+      if (c === quote) return out;
+      out += c;
+    }
+    fail('unterminated string');
+  }
+
+  function parseBare() {
+    const start = i;
+    while (i < s.length && SNBT_BARE.test(s[i])) i++;
+    if (i === start) fail(`unexpected character '${s[i]}'`);
+    return s.slice(start, i);
+  }
+
+  function parseScalar() {
+    const token = parseBare();
+    if (token === 'true' || token === 'false') {
+      return { type: 'bool', value: token === 'true' };
+    }
+    const m = SNBT_NUMBER.exec(token);
+    if (m) {
+      const suffix = m[1] || '';
+      return {
+        type: 'number',
+        value: suffix ? token.slice(0, -1) : token,
+        suffix: suffix.toLowerCase(),
+      };
+    }
+    return { type: 'string', value: token };
+  }
+
+  function parseCompound() {
+    i++;                       // {
+    const entries = [];
+    ws();
+    if (s[i] === '}') { i++; return { type: 'compound', entries }; }
+    for (;;) {
+      ws();
+      const key = (s[i] === '"' || s[i] === "'") ? parseQuoted() : parseBare();
+      ws();
+      if (s[i] !== ':') fail(`expected ':' after key '${key}'`);
+      i++;
+      entries.push({ key, node: parseValue() });
+      ws();
+      if (s[i] === ',') { i++; continue; }
+      if (s[i] === '}') { i++; return { type: 'compound', entries }; }
+      fail('expected ,or } in compound');
+    }
+  }
+
+  function parseList() {
+    i++;                       // [
+    ws();
+    // Typed arrays announce themselves as [I; …], [B; …] or [L; …].
+    let arrayType = null;
+    if (/^[IBL];/.test(s.slice(i, i + 2))) {
+      arrayType = s[i];
+      i += 2;
+    }
+    const items = [];
+    ws();
+    if (s[i] === ']') { i++; return { type: 'list', items, arrayType }; }
+    for (;;) {
+      items.push(parseValue());
+      ws();
+      if (s[i] === ',') { i++; continue; }
+      if (s[i] === ']') { i++; return { type: 'list', items, arrayType }; }
+      fail('expected , or ] in list');
+    }
+  }
+
+  function parseValue() {
+    ws();
+    if (i >= s.length) fail('unexpected end of input');
+    if (s[i] === '{') return parseCompound();
+    if (s[i] === '[') return parseList();
+    if (s[i] === '"' || s[i] === "'") return { type: 'string', value: parseQuoted() };
+    return parseScalar();
+  }
+
+  const root = parseValue();
+  ws();
+  if (i < s.length) fail('trailing characters after value');
+  return root;
+}
+
+// ---------------------------------------------------------------------------
+// NBT rendering
+// ---------------------------------------------------------------------------
+const NBT_TYPE_WORD = { b: 'byte', s: 'short', l: 'long', f: 'float', d: 'double' };
+
+// Deep branches start collapsed; the top two levels stay open so the modal
+// opens on something readable rather than a wall of triangles.
+const NBT_OPEN_DEPTH = 1;
+
+function nbtCount(node) {
+  if (node.type === 'compound') return `${node.entries.length} key${node.entries.length === 1 ? '' : 's'}`;
+  if (node.type === 'list') return `${node.items.length} item${node.items.length === 1 ? '' : 's'}`;
+  return '';
+}
+
+// A collapsed row is far more useful with a hint of what is inside it, so the
+// shapes that show up most in player data get a one-line summary.
+function nbtPreview(node) {
+  if (node.type === 'list') {
+    if (!node.items.length) return 'empty';
+    if (node.arrayType) {
+      const head = node.items.slice(0, 4).map(n => n.value).join(', ');
+      return node.items.length > 4 ? `${head}, …` : head;
+    }
+    return '';
+  }
+  if (node.type !== 'compound') return '';
+  const find = key => {
+    const hit = node.entries.find(e => e.key === key);
+    return hit && hit.node.type !== 'compound' && hit.node.type !== 'list' ? hit.node.value : null;
+  };
+  const id = find('id');
+  if (id) {
+    const count = find('Count') || find('count');
+    return count ? `${id} x${count}` : String(id);
+  }
+  const name = find('Name');
+  if (name) return String(name);
+  return '';
+}
+
+function nbtLeafHtml(node) {
+  if (node.type === 'number') {
+    const word = NBT_TYPE_WORD[node.suffix];
+    return `<span class="nbt-val nbt-num">${escapeHtml(node.value)}</span>`
+      + (word ? `<span class="nbt-type">${word}</span>` : '');
+  }
+  if (node.type === 'bool') {
+    return `<span class="nbt-val nbt-bool">${node.value}</span>`;
+  }
+  return `<span class="nbt-val nbt-str">${escapeHtml(node.value)}</span>`;
+}
+
+function nbtNodeHtml(node, key, depth) {
+  const label = key === null
+    ? ''
+    : `<span class="nbt-key">${escapeHtml(key)}</span>`;
+
+  if (node.type === 'compound' || node.type === 'list') {
+    const preview = nbtPreview(node);
+    const kids = node.type === 'compound'
+      ? node.entries.map(e => nbtNodeHtml(e.node, e.key, depth + 1)).join('')
+      : node.items.map((n, idx) => nbtNodeHtml(n, String(idx), depth + 1)).join('');
+    const empty = node.type === 'compound' ? !node.entries.length : !node.items.length;
+    const typeWord = node.type === 'list'
+      ? (node.arrayType ? `${node.arrayType}-array` : 'list')
+      : 'compound';
+    return `
+      <details class="nbt-node"${depth <= NBT_OPEN_DEPTH && !empty ? ' open' : ''}>
+        <summary>
+          ${label}
+          <span class="nbt-type">${typeWord}</span>
+          <span class="nbt-count">${escapeHtml(nbtCount(node))}</span>
+          ${preview ? `<span class="nbt-preview">${escapeHtml(preview)}</span>` : ''}
+        </summary>
+        <div class="nbt-children">${kids || '<div class="nbt-leaf nbt-dim">(empty)</div>'}</div>
+      </details>`;
+  }
+
+  return `<div class="nbt-leaf">${label}${nbtLeafHtml(node)}</div>`;
+}
+
+let nbtRaw = '';
+let nbtMode = 'tree';
+
+function renderPlayerData(raw) {
+  nbtRaw = raw || '';
+  const box = document.getElementById('modal-pdata');
+  if (!box) return;
+
+  if (nbtMode === 'raw') {
+    box.className = 'modal-content mono';
+    box.textContent = nbtRaw;
+    return;
+  }
+
+  const body = nbtRaw.replace(SNBT_PREFIX_RE, '').trim();
+  if (!body) { box.className = 'modal-content'; box.textContent = '(no data)'; return; }
+
+  let tree;
+  try {
+    tree = parseSNBT(body);
+  } catch (err) {
+    // Not SNBT — an error message from the server, or a shape this parser does
+    // not know. Showing it verbatim beats showing nothing.
+    box.className = 'modal-content mono';
+    box.textContent = nbtRaw;
+    return;
+  }
+  box.className = 'modal-content nbt-tree';
+  box.innerHTML = nbtNodeHtml(tree, null, 0);
+}
+
+function toggleNbtView() {
+  nbtMode = nbtMode === 'tree' ? 'raw' : 'tree';
+  const btn = document.getElementById('nbt-view-btn');
+  if (btn) btn.textContent = nbtMode === 'tree' ? 'RAW' : 'TREE';
+  renderPlayerData(nbtRaw);
+}
+
+function expandNbt(open) {
+  document.querySelectorAll('#modal-pdata .nbt-node').forEach(d => { d.open = open; });
+}
+
+function copyNbt() {
+  if (!nbtRaw) { toast('Nothing to copy yet.', 'error'); return; }
+  navigator.clipboard.writeText(nbtRaw)
+    .then(() => toast('Raw NBT copied.', 'ok'))
+    .catch(() => toast('Clipboard blocked by the browser.', 'error'));
 }
 
 // ---------------------------------------------------------------------------
@@ -1232,25 +2033,301 @@ async function runPackwiz(action) {
 // ---------------------------------------------------------------------------
 // Automation — Backups
 // ---------------------------------------------------------------------------
-// Replace your existing loadBackups() with this:
 async function loadBackups() {
   const container = document.getElementById('backup-list');
   container.innerHTML = '<div class="empty">Fetching archives…</div>';
-  const res = await fetch('/api/backups').catch(() => null);
-
-  if (!res || !res.ok) {
+  const data = await apiCall('/api/backups');
+  if (!data) {
     container.innerHTML = '<div class="empty err">Failed to fetch backups.</div>';
     return;
   }
 
-  const data = await res.json().catch(() => ({}));
-  container.innerHTML = (!data.backups || !data.backups.length)
+  const total = document.getElementById('backup-total');
+  if (total) {
+    total.textContent = data.entries && data.entries.length
+      ? `${data.entries.length} file(s), ${data.total_human}`
+      : '';
+  }
+  if (data.settings) applyRetentionInputs(data.settings);
+
+  const rows = data.entries || [];
+  container.innerHTML = !rows.length
     ? '<div class="empty">No archives found in the _backups directory.</div>'
-    : data.backups.map(b => `
-        <div class="list-row">
-          <div class="row-main mono">${escapeHtml(b)}</div>
-          <button class="mc-btn orange sm" onclick="executeRestore('${escapeHtml(b)}')">RESTORE</button>
+    : rows.map(b => `
+        <div class="list-row" data-backup="${escapeHtml(b.name)}">
+          <div class="row-main">
+            <div class="mono">${escapeHtml(b.name)}</div>
+            <div class="row-sub">${escapeHtml(b.human)} · ${escapeHtml(fmtTime(b.mtime))}</div>
+          </div>
+          <button class="mc-btn orange sm" data-act="restore">RESTORE</button>
+          <button class="mc-btn red sm" data-act="delete-backup">DEL</button>
         </div>`).join('');
+}
+
+// ---------------------------------------------------------------------------
+// Backup retention
+// ---------------------------------------------------------------------------
+function applyRetentionInputs(s) {
+  const count = document.getElementById('ret-count');
+  const days = document.getElementById('ret-days');
+  const on = document.getElementById('ret-enabled');
+  if (count) count.value = s.backup_keep_count;
+  if (days) days.value = s.backup_keep_days;
+  if (on) on.checked = !!s.backup_prune_enabled;
+}
+
+async function saveRetention() {
+  const body = {
+    backup_keep_count: Number(document.getElementById('ret-count').value || 0),
+    backup_keep_days: Number(document.getElementById('ret-days').value || 0),
+    backup_prune_enabled: document.getElementById('ret-enabled').checked,
+  };
+  const data = await apiCall('/api/settings', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!data) return;
+  toast('Retention policy saved.', 'ok');
+}
+
+async function previewPrune() {
+  const data = await apiCall('/api/backups/prune', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ dry_run: true }),
+  });
+  if (!data) return;
+  if (!data.removed.length) { toast(data.message, 'ok'); return; }
+  logTerm(`Prune preview — ${data.removed.length} archive(s) would go:`);
+  data.removed.forEach(f => logTerm(`  ${f}`));
+  toast(`${data.removed.length} archive(s) would be pruned — see the console.`, 'info');
+}
+
+async function runPrune() {
+  if (!confirm('Delete every archive outside the retention policy? This cannot be undone.')) return;
+  const data = await apiCall('/api/backups/prune', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({}),
+  });
+  if (!data) return;
+  logTerm(data.message);
+  toast(data.message, 'ok');
+  loadBackups();
+}
+
+async function deleteBackup(filename) {
+  if (!confirm(`Permanently delete ${filename}?`)) return;
+  const data = await apiCall(`/api/backups/${encodeURIComponent(filename)}`, { method: 'DELETE' });
+  if (!data) return;
+  toast(data.message, 'ok');
+  loadBackups();
+}
+
+// ---------------------------------------------------------------------------
+// Settings — watchdog + notifications
+// ---------------------------------------------------------------------------
+const SETTINGS_FIELDS = [
+  ['wd-enabled', 'watchdog_enabled', 'check'],
+  ['wd-restart', 'watchdog_restart', 'check'],
+  ['wd-max', 'watchdog_max_restarts', 'num'],
+  ['wd-window', 'watchdog_window_minutes', 'num'],
+  ['hook-url', 'webhook_url', 'text'],
+  ['hook-kind', 'webhook_kind', 'text'],
+  ['nt-crash', 'notify_crash', 'check'],
+  ['nt-restart', 'notify_restart', 'check'],
+  ['nt-backup', 'notify_backup', 'check'],
+  ['nt-state', 'notify_state', 'check'],
+];
+
+async function loadSettings() {
+  const data = await apiCall('/api/settings');
+  if (!data) return;
+  SETTINGS_FIELDS.forEach(([id, key, kind]) => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    if (kind === 'check') el.checked = !!data[key];
+    else el.value = data[key];
+  });
+  applyRetentionInputs(data);
+}
+
+async function saveSettings() {
+  const body = {};
+  SETTINGS_FIELDS.forEach(([id, key, kind]) => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    body[key] = kind === 'check' ? el.checked : kind === 'num' ? Number(el.value || 0) : el.value;
+  });
+  const hint = document.getElementById('settings-hint');
+  const data = await apiCall('/api/settings', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!data) { if (hint) { hint.textContent = 'Save failed.'; hint.className = 'save-hint dirty'; } return; }
+  if (hint) {
+    hint.textContent = '[SAVED]';
+    hint.className = 'save-hint saved';
+    setTimeout(() => { hint.textContent = ''; hint.className = 'save-hint'; }, 3000);
+  }
+  toast('Settings saved.', 'ok');
+}
+
+async function testWebhook() {
+  const data = await apiCall('/api/settings/test-webhook', { method: 'POST' });
+  if (!data) return;
+  toast(data.message, 'ok');
+}
+
+// ---------------------------------------------------------------------------
+// server.properties revision history
+// ---------------------------------------------------------------------------
+let propRevision = null;
+
+function propHistoryResetForServer() {
+  propRevision = null;
+  const diff = document.getElementById('prop-diff');
+  if (diff) { diff.hidden = true; diff.innerHTML = ''; }
+  const list = document.getElementById('prop-history');
+  if (list) list.innerHTML = '<div class="empty">Loading…</div>';
+  if (document.getElementById('panel-properties').classList.contains('active')) loadPropHistory();
+}
+
+async function loadPropHistory() {
+  if (!activeServer) return;
+  const el = document.getElementById('prop-history');
+  if (!el) return;
+  const data = await apiCall(`/api/server/${activeServer}/properties/history`);
+  if (!data) { el.innerHTML = '<div class="empty err">Could not read revisions.</div>'; return; }
+
+  const revs = data.revisions || [];
+  el.innerHTML = !revs.length
+    ? '<div class="empty">No revisions yet — the next save creates one.</div>'
+    : revs.map(r => `
+        <div class="list-row" data-rev="${escapeHtml(r.id)}">
+          <div class="row-main">
+            <div>${escapeHtml(fmtTime(r.saved))}</div>
+            <div class="row-sub">${escapeHtml(r.note || 'saved')} · ${r.keys} keys ·
+              ${r.changes === 0 ? 'identical to current' : `${r.changes} differ from current`}</div>
+          </div>
+          <button class="mc-btn sm" data-act="prop-view">DIFF</button>
+          <button class="mc-btn orange sm" data-act="prop-rollback"
+            ${r.changes === 0 ? 'disabled' : ''}>REVERT</button>
+        </div>`).join('');
+}
+
+async function viewPropRevision(rev) {
+  if (!activeServer) return;
+  const box = document.getElementById('prop-diff');
+  if (!box) return;
+  const data = await apiCall(
+    `/api/server/${activeServer}/properties/history/${encodeURIComponent(rev)}`);
+  if (!data) return;
+  propRevision = rev;
+
+  const rows = data.diff || [];
+  box.hidden = false;
+  box.innerHTML = `
+    <h4 class="section-heading">Reverting to ${escapeHtml(fmtTime(data.saved))} would change
+      ${rows.length} key${rows.length === 1 ? '' : 's'}</h4>
+    ${!rows.length
+      ? '<div class="empty">This revision matches the file on disk exactly.</div>'
+      : `<div class="diff-list">${rows.map(r => `
+          <div class="diff-row diff-${escapeHtml(r.change)}">
+            <span class="diff-key mono">${escapeHtml(r.key)}</span>
+            <span class="diff-before mono">${r.before === null ? '—' : escapeHtml(r.before)}</span>
+            <span class="diff-arrow">→</span>
+            <span class="diff-after mono">${r.after === null ? '—' : escapeHtml(r.after)}</span>
+          </div>`).join('')}</div>`}`;
+  box.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+async function rollbackProps(rev) {
+  if (!activeServer) return;
+  if (!confirm(`Roll ${activeServer}'s server.properties back to ${rev}?\n\n`
+    + 'The current file is snapshotted first, so this can be undone.')) return;
+  const data = await apiCall(`/api/server/${activeServer}/properties/rollback`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ revision: rev }),
+  });
+  if (!data) return;
+  logTerm(data.message);
+  toast(data.message, 'ok');
+  const diff = document.getElementById('prop-diff');
+  if (diff) { diff.hidden = true; diff.innerHTML = ''; }
+  await loadPropsFromServer();
+  loadPropHistory();
+}
+
+// ---------------------------------------------------------------------------
+// Modrinth search
+// ---------------------------------------------------------------------------
+// Seed the filters from the instance itself, so a search is scoped correctly
+// without the user re-entering what the server already knows. Only ever fills
+// blanks — whatever the user typed wins.
+async function seedModrinthFilters() {
+  if (!activeServer) return;
+  const loader = document.getElementById('mr-loader');
+  const version = document.getElementById('mr-version');
+  const type = document.getElementById('mr-type');
+  if (!loader || !version) return;
+
+  const res = await fetch(`/api/server/${activeServer}/runtime`).catch(() => null);
+  if (!res || !res.ok) return;
+  const d = await res.json().catch(() => ({}));
+  if (!loader.value && d.loader) loader.value = d.loader;
+  if (!version.value && /^\d+\.\d+(\.\d+)?$/.test(d.version || '')) version.value = d.version;
+  if (type && d.project_type && !type.dataset.touched) type.value = d.project_type;
+}
+
+async function searchModrinth() {
+  const box = document.getElementById('mr-results');
+  if (!box) return;
+  const q = document.getElementById('mr-query').value.trim();
+  const params = new URLSearchParams({
+    q,
+    project_type: document.getElementById('mr-type').value,
+    loader: document.getElementById('mr-loader').value.trim(),
+    version: document.getElementById('mr-version').value.trim(),
+  });
+  box.innerHTML = '<div class="empty">Searching Modrinth…</div>';
+  const data = await apiCall(`/api/modrinth/search?${params}`);
+  if (!data) { box.innerHTML = '<div class="empty err">Search failed.</div>'; return; }
+
+  const hits = data.hits || [];
+  box.innerHTML = !hits.length
+    ? '<div class="empty">Nothing matched. Try loosening the loader or version filter.</div>'
+    : hits.map(h => `
+        <div class="mr-row" data-slug="${escapeHtml(h.slug)}">
+          ${h.icon_url
+            ? `<img class="mr-icon" src="${escapeHtml(h.icon_url)}" alt="" loading="lazy">`
+            : '<span class="mr-icon mr-icon-blank"><i class="ti ti-package"></i></span>'}
+          <div class="mr-main">
+            <div class="mr-title">
+              ${escapeHtml(h.title)}
+              <span class="mr-slug mono">${escapeHtml(h.slug)}</span>
+            </div>
+            <div class="mr-desc">${escapeHtml(h.description)}</div>
+            <div class="mr-meta">
+              <span>${formatDownloads(h.downloads)} downloads</span>
+              ${h.server_side === 'unsupported'
+                ? '<span class="mr-warn">client-side only</span>'
+                : `<span>server: ${escapeHtml(h.server_side)}</span>`}
+              ${h.categories.length ? `<span>${escapeHtml(h.categories.join(', '))}</span>` : ''}
+            </div>
+          </div>
+          <button class="mc-btn green sm" data-act="mr-add">ADD</button>
+        </div>`).join('');
+}
+
+function formatDownloads(n) {
+  if (n >= 1e6) return `${(n / 1e6).toFixed(1)}M`;
+  if (n >= 1e3) return `${(n / 1e3).toFixed(1)}k`;
+  return String(n || 0);
+}
+
+function modrinthAdd(slug) {
+  const input = document.getElementById('mod-slug');
+  if (input) input.value = slug;
+  runPackwiz('add');
 }
 
 // Add the new execution function:
@@ -1962,3 +3039,67 @@ function copyDebugReport() {
   catch (e) { toast('Copy failed.', 'error'); }
   document.body.removeChild(ta);
 }
+
+// ---------------------------------------------------------------------------
+// Delegated click handlers for the lists added above
+//
+// Same reasoning as the file manager: names, filenames and revision ids ride
+// in data attributes instead of being interpolated into onclick strings, so a
+// value containing a quote cannot break out of its handler.
+// ---------------------------------------------------------------------------
+document.addEventListener('DOMContentLoaded', () => {
+  const on = (id, handler) => {
+    const el = document.getElementById(id);
+    if (el) el.addEventListener('click', handler);
+  };
+
+  on('player-list', handlePlayerRowClick);
+
+  on('access-list', ev => {
+    const hit = ev.target.closest('[data-act="access-remove"]');
+    if (!hit) return;
+    const value = hit.closest('.list-row').dataset.value;
+    if (confirm(`Remove ${value} from ${accessKind}?`)) accessEdit('remove', value);
+  });
+
+  on('backup-list', ev => {
+    const hit = ev.target.closest('[data-act]');
+    if (!hit) return;
+    const file = hit.closest('.list-row').dataset.backup;
+    if (hit.dataset.act === 'restore') executeRestore(file);
+    if (hit.dataset.act === 'delete-backup') deleteBackup(file);
+  });
+
+  on('prop-history', ev => {
+    const hit = ev.target.closest('[data-act]');
+    if (!hit) return;
+    const rev = hit.closest('.list-row').dataset.rev;
+    if (hit.dataset.act === 'prop-view') viewPropRevision(rev);
+    if (hit.dataset.act === 'prop-rollback') rollbackProps(rev);
+  });
+
+  on('mr-results', ev => {
+    const hit = ev.target.closest('[data-act="mr-add"]');
+    if (!hit) return;
+    modrinthAdd(hit.closest('.mr-row').dataset.slug);
+  });
+
+  on('cluster-graphs', ev => {
+    const hit = ev.target.closest('.graph-name');
+    if (!hit) return;
+    // Jumping straight to the instance that spiked is the whole point of
+    // having every server on one screen.
+    const name = hit.dataset.target;
+    const row = (clusterMetrics?.servers || []).find(s => s.server === name);
+    setServerTarget(name, row ? row.status : 'unknown');
+    sw('overview', document.querySelector('[data-panel=overview]'));
+  });
+
+  // Picking a project type by hand should stop the server's own flavour from
+  // overwriting it the next time the panel opens.
+  const mrType = document.getElementById('mr-type');
+  if (mrType) mrType.addEventListener('change', () => { mrType.dataset.touched = '1'; });
+
+  renderAccessTabs();
+  syncModArg();
+});

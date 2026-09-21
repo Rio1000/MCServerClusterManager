@@ -55,6 +55,9 @@
         <div class="sb-item active" data-panel="instances" onclick="sw('instances',this)">
           <i class="ti ti-server"></i> Instances
         </div>
+        <div class="sb-item" data-panel="cluster" onclick="sw('cluster',this)">
+          <i class="ti ti-chart-line"></i> Cluster Load
+        </div>
 
         <div class="sb-sec needs-target">Active Instance</div>
         <div class="sb-item needs-target" data-panel="overview" onclick="sw('overview',this)">
@@ -243,6 +246,59 @@
               <div class="stat-slot"><span class="stat-num sm" id="c-stat-ram">--</span><span class="stat-lbl">Docker RAM</span></div>
             </div>
           </div>
+
+          <div class="inv-panel">
+            <div class="inv-title">
+              <span>History</span>
+              <div class="title-actions">
+                <select class="mc-select sm" id="hist-range" onchange="loadServerMetrics()"
+                  aria-label="History window">
+                  <option value="30">Last 30 min</option>
+                  <option value="60" selected>Last hour</option>
+                  <option value="180">Last 3 hours</option>
+                </select>
+                <button class="mc-btn sm" onclick="loadServerMetrics()">REFRESH</button>
+              </div>
+            </div>
+            <p class="card-hint">Sampled every 15s by the daemon and held in memory — it starts
+              over when the manager restarts.</p>
+            <div id="hist-spark" class="spark-stack">
+              <div class="empty">Loading history…</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- ────────────── CLUSTER LOAD ────────────── -->
+        <div id="panel-cluster" class="panel">
+          <div class="panel-head">
+            <h2>Cluster Load</h2>
+            <p>CPU and memory for every managed instance, side by side.</p>
+          </div>
+
+          <div class="inv-panel">
+            <div class="inv-title">
+              <span>Resource History</span>
+              <div class="title-actions">
+                <select class="mc-select sm" id="cluster-range" onchange="loadClusterMetrics()"
+                  aria-label="History window">
+                  <option value="30">Last 30 min</option>
+                  <option value="60" selected>Last hour</option>
+                  <option value="180">Last 3 hours</option>
+                </select>
+                <select class="mc-select sm" id="cluster-metric" onchange="renderClusterMetrics()"
+                  aria-label="Metric">
+                  <option value="cpu">CPU %</option>
+                  <option value="mem_mb">Memory (MB)</option>
+                </select>
+                <button class="mc-btn sm" onclick="loadClusterMetrics()">REFRESH</button>
+              </div>
+            </div>
+            <p class="card-hint" id="cluster-hint">Samples come from one <code>docker stats</code>
+              call every 15s, so this costs nothing per server and never touches RCON.</p>
+            <div id="cluster-graphs" class="graph-stack">
+              <div class="empty">Loading…</div>
+            </div>
+          </div>
         </div>
 
         <!-- ────────────── CONSOLE ────────────── -->
@@ -256,14 +312,30 @@
             <div class="inv-title">
               <span>Terminal Stream</span>
               <div class="title-actions">
+                <span id="console-muted" class="muted-count"></span>
+                <button class="mc-btn sm" id="console-noise-btn" onclick="toggleConsoleNoise()"
+                  title="RCON/Query poller thread chatter">SHOW NOISE</button>
+                <button class="mc-btn sm" onclick="downloadConsole()">SAVE</button>
                 <button class="mc-btn sm" onclick="clearConsole()">CLEAR</button>
               </div>
+            </div>
+            <div class="console-filter">
+              <input type="text" class="mc-input" id="console-search" placeholder="Filter lines…"
+                oninput="applyConsoleFilter()" aria-label="Filter console lines">
+              <select class="mc-select" id="console-level" onchange="applyConsoleFilter()"
+                aria-label="Minimum severity">
+                <option value="all">All levels</option>
+                <option value="warn">Warnings &amp; errors</option>
+                <option value="error">Errors only</option>
+              </select>
+              <span id="console-filter-count" class="muted-count"></span>
             </div>
             <div class="console-box" id="console-log"></div>
             <div class="cin-row">
               <span class="cin-prompt">&gt;</span>
-              <input type="text" class="mc-input-lg" id="console-input" placeholder="Enter command…"
-                onkeydown="if(event.key==='Enter')sendTerminalCommand()">
+              <input type="text" class="mc-input-lg" id="console-input"
+                placeholder="Enter command…  (↑/↓ for history)" autocomplete="off"
+                onkeydown="consoleKeydown(event)">
               <button class="mc-btn green" onclick="sendTerminalCommand()">EXEC</button>
             </div>
           </div>
@@ -278,7 +350,7 @@
         <div id="panel-players" class="panel">
           <div class="panel-head">
             <h2>Players</h2>
-            <p>Everyone connected to the active instance.</p>
+            <p>Everyone connected to the active instance, plus who is allowed in.</p>
           </div>
 
           <div class="inv-panel">
@@ -291,6 +363,55 @@
             </div>
             <div class="player-list" id="player-list">
               <div class="empty">Select an active server instance to view players.</div>
+            </div>
+          </div>
+
+          <div class="inv-panel">
+            <div class="inv-title"><span>Act on a Name</span></div>
+            <p class="card-hint">For someone who is offline, or not in the list above. Commands
+              go over RCON, so the server has to be running.</p>
+            <div class="act-row">
+              <input type="text" class="mc-input" id="mod-player" placeholder="Player name"
+                maxlength="32" aria-label="Player name">
+              <select class="mc-select" id="mod-action" onchange="syncModArg()" aria-label="Action">
+                <option value="kick">Kick</option>
+                <option value="ban">Ban</option>
+                <option value="pardon">Unban</option>
+                <option value="op">Op</option>
+                <option value="deop">Deop</option>
+                <option value="whitelist_add">Whitelist add</option>
+                <option value="whitelist_remove">Whitelist remove</option>
+                <option value="gamemode">Set gamemode</option>
+                <option value="kill">Kill</option>
+              </select>
+              <input type="text" class="mc-input" id="mod-arg" placeholder="Reason (optional)"
+                maxlength="120" aria-label="Reason">
+              <button class="mc-btn green" onclick="runModAction()">RUN</button>
+            </div>
+          </div>
+
+          <div class="inv-panel">
+            <div class="inv-title">
+              <span>Access Lists</span>
+              <div class="title-actions">
+                <span id="access-mode" class="muted-count"></span>
+                <button class="mc-btn sm" onclick="loadAccessList()">REFRESH</button>
+              </div>
+            </div>
+            <div class="tab-row" id="access-tabs"></div>
+            <p class="card-hint" id="access-hint">
+              While the server is up these edits go over RCON and apply instantly. While it is
+              down the JSON file is edited directly and takes effect on next start.
+            </p>
+            <div class="act-row">
+              <input type="text" class="mc-input" id="access-value" placeholder="Player name"
+                maxlength="45" aria-label="Entry to add">
+              <input type="text" class="mc-input" id="access-reason" placeholder="Reason (bans only)"
+                maxlength="120" aria-label="Reason">
+              <button class="mc-btn green" onclick="accessAdd()">ADD</button>
+            </div>
+            <div id="access-list" class="scroll-box">
+              <div class="empty">Select an instance to load its access lists.</div>
             </div>
           </div>
         </div>
@@ -316,6 +437,21 @@
               <button class="mc-btn green" onclick="saveProps()">Save Changes</button>
               <span id="save-hint-props" class="save-hint"></span>
             </div>
+          </div>
+
+          <div class="inv-panel">
+            <div class="inv-title">
+              <span>Revision History</span>
+              <div class="title-actions">
+                <button class="mc-btn sm" onclick="loadPropHistory()">REFRESH</button>
+              </div>
+            </div>
+            <p class="card-hint">Every save stores the previous file. Pick a revision to see
+              exactly what reverting to it would change.</p>
+            <div id="prop-history" class="scroll-box">
+              <div class="empty">Select an instance to load its revisions.</div>
+            </div>
+            <div id="prop-diff" class="prop-diff" hidden></div>
           </div>
         </div>
 
@@ -458,6 +594,33 @@
                 <div class="save-bar">
                   <button class="mc-btn green" onclick="runPackwiz('add')">Inject Mod</button>
                   <button class="mc-btn red" onclick="runPackwiz('remove')">Eject Mod</button>
+                </div>
+              </div>
+
+              <div class="inv-panel">
+                <div class="inv-title"><span>Search Modrinth</span></div>
+                <p class="card-hint">Find a project without leaving the manager. Loader and
+                  version default to whatever this instance is running.</p>
+                <div class="act-row">
+                  <input type="text" class="mc-input" id="mr-query" placeholder="Search mods…"
+                    onkeydown="if(event.key==='Enter')searchModrinth()" aria-label="Search query">
+                  <button class="mc-btn green" onclick="searchModrinth()">SEARCH</button>
+                </div>
+                <div class="act-row">
+                  <select class="mc-select" id="mr-type" aria-label="Project type">
+                    <option value="mod">Mods</option>
+                    <option value="plugin">Plugins</option>
+                    <option value="datapack">Datapacks</option>
+                    <option value="modpack">Modpacks</option>
+                    <option value="shader">Shaders</option>
+                  </select>
+                  <input type="text" class="mc-input" id="mr-loader" placeholder="Loader (fabric)"
+                    maxlength="16" aria-label="Loader">
+                  <input type="text" class="mc-input" id="mr-version" placeholder="MC version"
+                    maxlength="24" aria-label="Game version">
+                </div>
+                <div id="mr-results" class="scroll-box tall">
+                  <div class="empty">Search to see results.</div>
                 </div>
               </div>
 
@@ -638,8 +801,31 @@
               </div>
               <p class="card-hint">Capture a tar.gz archive of the active server's /data volume.</p>
               <button class="mc-btn green block" onclick="triggerBackup()">CAPTURE SNAPSHOT</button>
-              <h4 class="section-heading">Archive Registry</h4>
-              <div id="backup-list" class="scroll-box">
+
+              <h4 class="section-heading">Retention</h4>
+              <p class="card-hint">Applied per server after every snapshot. 0 disables a rule;
+                with both set, an archive has to satisfy each of them to be kept.</p>
+              <div class="grid-auto">
+                <div class="field">
+                  <label class="field-lbl" for="ret-count">Keep newest (per server)</label>
+                  <input type="number" id="ret-count" class="mc-input" min="0" max="500" value="10">
+                </div>
+                <div class="field">
+                  <label class="field-lbl" for="ret-days">Keep for (days)</label>
+                  <input type="number" id="ret-days" class="mc-input" min="0" max="3650" value="0">
+                </div>
+              </div>
+              <label class="check-line">
+                <input type="checkbox" id="ret-enabled"> Prune automatically after each snapshot
+              </label>
+              <div class="save-bar">
+                <button class="mc-btn green" onclick="saveRetention()">SAVE POLICY</button>
+                <button class="mc-btn" onclick="previewPrune()">PREVIEW</button>
+                <button class="mc-btn orange" onclick="runPrune()">PRUNE NOW</button>
+              </div>
+
+              <h4 class="section-heading">Archive Registry <span id="backup-total" class="muted-count"></span></h4>
+              <div id="backup-list" class="scroll-box tall">
                 <div class="empty">Loading…</div>
               </div>
             </div>
@@ -673,6 +859,69 @@
               </div>
             </div>
           </div>
+
+          <div class="inv-panel">
+            <div class="inv-title">
+              <span>Watchdog &amp; Notifications</span>
+              <div class="title-actions">
+                <button class="mc-btn sm" onclick="loadSettings()">RELOAD</button>
+              </div>
+            </div>
+            <p class="card-hint">The watchdog checks every 30s for a container that exited without
+              being asked to. Stops you triggered here or from a cron job are never treated as
+              crashes.</p>
+
+            <div class="col-2">
+              <div>
+                <h4 class="section-heading">Crash Handling</h4>
+                <label class="check-line">
+                  <input type="checkbox" id="wd-enabled"> Watch for crashes
+                </label>
+                <label class="check-line">
+                  <input type="checkbox" id="wd-restart" checked> Restart automatically
+                </label>
+                <div class="grid-auto">
+                  <div class="field">
+                    <label class="field-lbl" for="wd-max">Max restarts</label>
+                    <input type="number" id="wd-max" class="mc-input" min="1" max="50" value="3">
+                  </div>
+                  <div class="field">
+                    <label class="field-lbl" for="wd-window">Within (minutes)</label>
+                    <input type="number" id="wd-window" class="mc-input" min="1" max="1440" value="60">
+                  </div>
+                </div>
+              </div>
+
+              <div>
+                <h4 class="section-heading">Webhook</h4>
+                <div class="field">
+                  <label class="field-lbl" for="hook-url">URL</label>
+                  <input type="text" id="hook-url" class="mc-input" placeholder="https://discord.com/api/webhooks/…">
+                </div>
+                <div class="field">
+                  <label class="field-lbl" for="hook-kind">Format</label>
+                  <select id="hook-kind" class="mc-select">
+                    <option value="discord">Discord</option>
+                    <option value="slack">Slack</option>
+                    <option value="ntfy">ntfy (plain text)</option>
+                    <option value="raw">Raw JSON</option>
+                  </select>
+                </div>
+                <h4 class="section-heading">Send On</h4>
+                <label class="check-line"><input type="checkbox" id="nt-crash" checked> Crashes</label>
+                <label class="check-line"><input type="checkbox" id="nt-restart" checked> Auto-restarts</label>
+                <label class="check-line"><input type="checkbox" id="nt-backup"> Completed backups</label>
+                <label class="check-line"><input type="checkbox" id="nt-state"> Ordinary start/stop</label>
+              </div>
+            </div>
+
+            <div class="save-bar">
+              <button class="mc-btn green" onclick="saveSettings()">SAVE SETTINGS</button>
+              <button class="mc-btn" onclick="testWebhook()">SEND TEST</button>
+              <span id="settings-hint" class="save-hint"></span>
+            </div>
+          </div>
+
         </div>
 
       </div><!-- /mc-main -->
@@ -683,7 +932,13 @@
       <div class="modal-box">
         <div class="modal-title">
           <span id="modal-pname">Player NBT Data</span>
-          <button class="mc-btn red sm" onclick="closeModal()">CLOSE</button>
+          <div class="title-actions">
+            <button class="mc-btn sm" id="nbt-view-btn" onclick="toggleNbtView()">RAW</button>
+            <button class="mc-btn sm" onclick="expandNbt(true)">EXPAND</button>
+            <button class="mc-btn sm" onclick="expandNbt(false)">COLLAPSE</button>
+            <button class="mc-btn sm" onclick="copyNbt()">COPY</button>
+            <button class="mc-btn red sm" onclick="closeModal()">CLOSE</button>
+          </div>
         </div>
         <div class="tab-row" id="modal-tabs"></div>
         <div id="modal-pdata" class="modal-content">Connecting to RCON feed…</div>

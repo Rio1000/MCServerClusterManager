@@ -1,4 +1,5 @@
 import asyncio
+import collections
 import json
 import os
 import re
@@ -9,6 +10,10 @@ import socket
 import stat
 import subprocess
 import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
 import uuid
 from contextlib import asynccontextmanager
 
@@ -19,6 +24,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.websockets import WebSocketDisconnect
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
 import uvicorn
 
 # ---------------------------------------------------------------------------
@@ -36,6 +42,18 @@ BACKUP_DIR    = os.path.join(DATA_DIR, "_backups")
 JOBS_FILE     = os.path.join(DATA_DIR, "_jobs.json")
 TEMPLATES_FILE = os.path.join(DATA_DIR, "_templates.json")
 AUDIT_LOG     = os.path.join(DATA_DIR, "_audit.log")
+SETTINGS_FILE = os.path.join(DATA_DIR, "_settings.json")
+PROP_HISTORY_DIR = os.path.join(DATA_DIR, "_prop_history")
+
+# How often the background sampler records container CPU/memory, and how many
+# samples it keeps per server. 15s x 720 ≈ 3 hours of history, in memory only —
+# it is telemetry for the graphs, not a metrics store worth persisting.
+METRICS_INTERVAL = 15
+METRICS_KEEP     = 720
+
+# The watchdog compares container state between ticks, so it needs to run often
+# enough to catch a crash but not so often that it hammers the daemon.
+WATCHDOG_INTERVAL = 30
 
 # packwiz has no tagged releases upstream — its CI only publishes GitHub
 # Actions artifacts, which need an authenticated API call to fetch. So the
@@ -76,6 +94,118 @@ def audit(action: str, target: str, detail: str = ""):
         pass
 
 # ---------------------------------------------------------------------------
+# Settings
+#
+# One small JSON file for the knobs that used to be hard-coded: backup
+# retention, the crash watchdog and where notifications go. Anything missing
+# falls back to DEFAULT_SETTINGS, so an older install picks up new keys without
+# being migrated.
+# ---------------------------------------------------------------------------
+DEFAULT_SETTINGS: dict = {
+    # Backups: 0 disables that half of the policy. Both can run together —
+    # a file has to survive the count rule *and* the age rule to be kept.
+    # Pruning is off until it is turned on: the numbers are only a suggestion
+    # until someone has looked at them, and the cost of a wrong default here is
+    # a deleted archive.
+    "backup_keep_count": 10,
+    "backup_keep_days": 0,
+    "backup_prune_enabled": False,
+    # Watchdog
+    "watchdog_enabled": False,
+    "watchdog_restart": True,
+    "watchdog_max_restarts": 3,      # per server, per window
+    "watchdog_window_minutes": 60,
+    # Notifications
+    "webhook_url": "",
+    "webhook_kind": "discord",       # discord | slack | ntfy | raw
+    "notify_crash": True,
+    "notify_restart": True,
+    "notify_backup": False,
+    "notify_state": False,           # ordinary start/stop transitions
+}
+
+_settings_lock = asyncio.Lock()
+
+def _load_settings() -> dict:
+    merged = dict(DEFAULT_SETTINGS)
+    if os.path.exists(SETTINGS_FILE):
+        try:
+            with open(SETTINGS_FILE) as f:
+                stored = json.load(f)
+            if isinstance(stored, dict):
+                merged.update({k: v for k, v in stored.items() if k in DEFAULT_SETTINGS})
+        except Exception:
+            pass
+    return merged
+
+def _save_settings(settings: dict) -> None:
+    with open(SETTINGS_FILE, "w") as f:
+        json.dump(settings, f, indent=4)
+
+def _coerce_settings(raw: dict) -> dict:
+    """Clamp incoming settings to the shape and range each key expects."""
+    out = _load_settings()
+    for key, default in DEFAULT_SETTINGS.items():
+        if key not in raw:
+            continue
+        val = raw[key]
+        if isinstance(default, bool):
+            out[key] = bool(val)
+        elif isinstance(default, int):
+            try:
+                out[key] = max(0, min(int(val), 100000))
+            except (TypeError, ValueError):
+                pass
+        else:
+            out[key] = str(val)[:500]
+    if out["webhook_kind"] not in ("discord", "slack", "ntfy", "raw"):
+        out["webhook_kind"] = "discord"
+    url = out["webhook_url"].strip()
+    if url and not url.startswith(("http://", "https://")):
+        raise HTTPException(400, "Webhook URL must start with http:// or https://.")
+    out["webhook_url"] = url
+    return out
+
+# ---------------------------------------------------------------------------
+# Notifications
+#
+# urllib rather than a new dependency: one POST, no retries, and every failure
+# is swallowed — a dead webhook must never take down a backup or a restart.
+# ---------------------------------------------------------------------------
+def _notify_blocking(text: str, settings: dict | None = None) -> bool:
+    s = settings or _load_settings()
+    url = (s.get("webhook_url") or "").strip()
+    if not url:
+        return False
+    kind = s.get("webhook_kind", "discord")
+    if kind == "discord":
+        body, ctype = json.dumps({"content": text[:1900]}).encode(), "application/json"
+    elif kind == "slack":
+        body, ctype = json.dumps({"text": text[:3000]}).encode(), "application/json"
+    elif kind == "ntfy":
+        body, ctype = text[:3000].encode(), "text/plain"
+    else:
+        body, ctype = json.dumps({"text": text[:3000]}).encode(), "application/json"
+    req = urllib.request.Request(url, data=body, method="POST",
+                                 headers={"Content-Type": ctype,
+                                          "User-Agent": "MCServerClusterManager"})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return 200 <= resp.status < 300
+    except Exception:
+        return False
+
+async def notify(event: str, text: str) -> None:
+    """Fire a webhook if this event class is enabled. Never raises."""
+    s = _load_settings()
+    if event and not s.get(f"notify_{event}", False):
+        return
+    try:
+        await asyncio.to_thread(_notify_blocking, text, s)
+    except Exception:
+        pass
+
+# ---------------------------------------------------------------------------
 # Lifespan
 # ---------------------------------------------------------------------------
 scheduler  = AsyncIOScheduler()
@@ -87,6 +217,7 @@ psutil.cpu_percent(interval=None)
 async def lifespan(app: FastAPI):
     os.makedirs(DATA_DIR,   exist_ok=True)
     os.makedirs(BACKUP_DIR, exist_ok=True)
+    os.makedirs(PROP_HISTORY_DIR, exist_ok=True)
     for j in _load_jobs_raw():
         try:
             scheduler.add_job(
@@ -95,9 +226,20 @@ async def lifespan(app: FastAPI):
             )
         except Exception as exc:
             print(f"[startup] job {j['id']} failed: {exc}")
+
+    # System jobs use reserved ids so a user cron job can never collide with
+    # them and the delete-job endpoint cannot remove them.
+    scheduler.add_job(_sample_metrics, IntervalTrigger(seconds=METRICS_INTERVAL),
+                      id="_sys_metrics", replace_existing=True,
+                      max_instances=1, coalesce=True)
+    scheduler.add_job(_watchdog_tick, IntervalTrigger(seconds=WATCHDOG_INTERVAL),
+                      id="_sys_watchdog", replace_existing=True,
+                      max_instances=1, coalesce=True)
     scheduler.start()
     yield
     scheduler.shutdown(wait=False)
+
+SYSTEM_JOB_IDS = {"_sys_metrics", "_sys_watchdog"}
 
 app = FastAPI(lifespan=lifespan)
 
@@ -129,6 +271,170 @@ def _get_containers() -> list[dict]:
         if len(parts) >= 2:
             servers.append({"name": parts[0], "status": parts[1], "ports": parts[2] if len(parts) > 2 else ""})
     return servers
+
+# ---------------------------------------------------------------------------
+# Metrics history
+#
+# A per-server ring buffer fed by one `docker stats` call on a timer. It is
+# deliberately RCON-free: the player and TPS numbers come from RCON, and
+# polling those for every server on a timer is what floods the console with
+# connection churn. Player counts are recorded opportunistically instead,
+# whenever the UI's own poller asks for a list.
+# ---------------------------------------------------------------------------
+_metrics: dict[str, collections.deque] = {}
+
+_MEM_RE = re.compile(r'^\s*([\d.]+)\s*([KMGT]?i?B)\s*/', re.I)
+_MEM_UNITS = {"B": 1 / 1048576, "KIB": 1 / 1024, "MIB": 1, "GIB": 1024, "TIB": 1048576,
+              "KB": 1 / 1024, "MB": 1, "GB": 1024, "TB": 1048576}
+
+def _mem_to_mb(usage: str) -> float | None:
+    """'1.523GiB / 4GiB' -> 1559.6"""
+    m = _MEM_RE.match(usage or "")
+    if not m:
+        return None
+    try:
+        return round(float(m.group(1)) * _MEM_UNITS.get(m.group(2).upper(), 1), 1)
+    except (TypeError, ValueError):
+        return None
+
+def _pct(raw: str) -> float | None:
+    try:
+        return round(float((raw or "").strip().rstrip("%")), 2)
+    except (TypeError, ValueError):
+        return None
+
+def _bucket(server: str) -> collections.deque:
+    if server not in _metrics:
+        _metrics[server] = collections.deque(maxlen=METRICS_KEEP)
+    return _metrics[server]
+
+def _record_players(server: str, count: int) -> None:
+    """Stamp a player count onto the most recent sample for this server."""
+    bucket = _metrics.get(server)
+    if bucket and bucket[-1].get("players") is None:
+        bucket[-1]["players"] = count
+
+async def _sample_metrics() -> None:
+    managed = {c["name"] for c in await asyncio.to_thread(_get_containers)}
+    if not managed:
+        return
+    code, out, _ = await asyncio.to_thread(_run, [
+        "docker", "stats", "--no-stream", "--format",
+        "{{.Name}}|{{.CPUPerc}}|{{.MemUsage}}|{{.MemPerc}}",
+    ], 30)
+    if code != 0:
+        return
+    ts = int(time.time())
+    seen = set()
+    for line in out.splitlines():
+        parts = line.split("|")
+        if len(parts) < 4 or parts[0] not in managed:
+            continue
+        seen.add(parts[0])
+        _bucket(parts[0]).append({
+            "t": ts,
+            "cpu": _pct(parts[1]),
+            "mem_mb": _mem_to_mb(parts[2]),
+            "mem_pct": _pct(parts[3]),
+            "players": None,
+        })
+    # A stopped server gets an explicit null sample so its graph shows a gap
+    # instead of drawing a straight line across the downtime.
+    for name in managed - seen:
+        if name in _metrics:
+            _bucket(name).append({"t": ts, "cpu": None, "mem_mb": None,
+                                  "mem_pct": None, "players": None})
+
+# ---------------------------------------------------------------------------
+# Crash watchdog
+# ---------------------------------------------------------------------------
+_EXIT_CODE_RE = re.compile(r'Exited\s*\((\d+)\)')
+
+_container_prev_state: dict[str, str] = {}
+_restart_history: dict[str, list[float]] = {}
+# Stops the manager itself asked for. Without this the watchdog would treat
+# every deliberate shutdown as a crash and start the server straight back up.
+_intentional_stops: set[str] = set()
+
+def _state_of(status: str) -> tuple[str, int | None]:
+    s = (status or "").strip()
+    if s.lower().startswith("up"):
+        return "running", None
+    m = _EXIT_CODE_RE.search(s)
+    if m:
+        return "exited", int(m.group(1))
+    if s.lower().startswith("restarting"):
+        return "restarting", None
+    return "other", None
+
+def _mark_intentional(name: str) -> None:
+    _intentional_stops.add(name)
+
+def _under_restart_limit(name: str, settings: dict) -> bool:
+    window = max(1, int(settings.get("watchdog_window_minutes", 60))) * 60
+    cutoff = time.time() - window
+    hist = [t for t in _restart_history.get(name, []) if t > cutoff]
+    _restart_history[name] = hist
+    return len(hist) < max(1, int(settings.get("watchdog_max_restarts", 3)))
+
+async def _watchdog_tick() -> None:
+    try:
+        containers = await asyncio.to_thread(_get_containers)
+    except Exception:
+        return
+    settings = _load_settings()
+    enabled  = bool(settings.get("watchdog_enabled"))
+
+    for c in containers:
+        name = c["name"]
+        state, exit_code = _state_of(c.get("status", ""))
+        prev = _container_prev_state.get(name)
+        _container_prev_state[name] = state
+
+        # State and the intentional-stop flags are tracked even while the
+        # watchdog is off, so turning it on mid-flight neither mistakes the
+        # first transition it sees for a crash nor trips over a stale flag.
+        if prev is None or prev == state:
+            continue
+
+        if state == "running" and prev in ("exited", "restarting"):
+            _intentional_stops.discard(name)
+            if enabled:
+                await notify("state", f"✅ `{name}` is up.")
+            continue
+
+        if state != "exited" or prev != "running":
+            continue
+
+        if name in _intentional_stops:
+            _intentional_stops.discard(name)
+            if enabled:
+                await notify("state", f"⏹️ `{name}` stopped.")
+            continue
+
+        if not enabled:
+            continue
+
+        # Unexpected exit.
+        detail = f"exit code {exit_code}" if exit_code is not None else "unknown exit"
+        audit("WATCHDOG_CRASH", name, detail)
+        await notify("crash", f"💥 `{name}` exited unexpectedly ({detail}).")
+
+        if not settings.get("watchdog_restart", True):
+            continue
+        if not _under_restart_limit(name, settings):
+            audit("WATCHDOG_GIVEUP", name, "restart limit reached")
+            await notify("crash", f"🛑 `{name}` hit its restart limit — not restarting again.")
+            continue
+
+        _restart_history.setdefault(name, []).append(time.time())
+        code, _, err = await asyncio.to_thread(_run, ["docker", "start", name], 60)
+        if code == 0:
+            audit("WATCHDOG_RESTART", name, detail)
+            await notify("restart", f"🔁 `{name}` crashed ({detail}) — restarted automatically.")
+        else:
+            audit("WATCHDOG_RESTART_FAIL", name, err[:200])
+            await notify("crash", f"⚠️ `{name}` crashed and the restart failed: {err[:200]}")
 
 # Accepts "19132", "19132/udp", "25566:25565" or "19132:19132/udp".
 _PORT_SPEC_RE = re.compile(r'^(?:(\d{1,5}):)?(\d{1,5})(?:/(tcp|udp))?$', re.I)
@@ -496,6 +802,149 @@ def _get_addons(server_name: str) -> dict:
     return addons
 
 # ---------------------------------------------------------------------------
+# Players — moderation over RCON
+#
+# Names are restricted to the Minecraft character set plus the dot Floodgate
+# prefixes Bedrock players with. Nothing here reaches a shell (argv is passed
+# to subprocess as a list), so the pattern exists to stop a crafted name from
+# injecting extra tokens into the RCON command string.
+# ---------------------------------------------------------------------------
+_PLAYER_RE = re.compile(r'^[A-Za-z0-9_.\-]{1,32}$')
+_IP_RE     = re.compile(r'^[0-9a-fA-F:.]{3,45}$')
+
+GAMEMODES  = ("survival", "creative", "adventure", "spectator")
+
+def _validate_player(name: str) -> str:
+    if not _PLAYER_RE.match(name or ""):
+        raise HTTPException(400, "Invalid player name.")
+    return name
+
+def _clean_reason(text: str) -> str:
+    """Free text bound for an RCON command — no newlines, bounded length."""
+    return re.sub(r'[\n\r]', ' ', str(text or "")).strip()[:120]
+
+def _player_command(action: str, player: str, arg: str) -> str:
+    reason = _clean_reason(arg)
+    if action == "kick":
+        return f"kick {player} {reason}".strip()
+    if action == "ban":
+        return f"ban {player} {reason}".strip()
+    if action == "pardon":
+        return f"pardon {player}"
+    if action == "op":
+        return f"op {player}"
+    if action == "deop":
+        return f"deop {player}"
+    if action == "whitelist_add":
+        return f"whitelist add {player}"
+    if action == "whitelist_remove":
+        return f"whitelist remove {player}"
+    if action == "kill":
+        return f"kill {player}"
+    if action == "gamemode":
+        if reason not in GAMEMODES:
+            raise HTTPException(400, f"Gamemode must be one of: {', '.join(GAMEMODES)}.")
+        return f"gamemode {reason} {player}"
+    raise HTTPException(400, "Unsupported player action.")
+
+def _rcon(server: str, command: str, timeout: float = 20) -> tuple[int, str, str]:
+    return _run(["docker", "exec", server, "rcon-cli", command], timeout)
+
+def _is_running(server: str) -> bool:
+    for c in _get_containers():
+        if c["name"] == server:
+            return _state_of(c.get("status", ""))[0] == "running"
+    return False
+
+# ---------------------------------------------------------------------------
+# Access lists — whitelist / ops / bans
+#
+# These live as JSON in the server volume. While the server is up the edits go
+# through RCON so they take effect immediately *and* the server rewrites the
+# file itself; while it is down the file is the only thing there is, so it gets
+# edited directly.
+# ---------------------------------------------------------------------------
+ACCESS_FILES = {
+    "whitelist":      "whitelist.json",
+    "ops":            "ops.json",
+    "banned-players": "banned-players.json",
+    "banned-ips":     "banned-ips.json",
+}
+
+def _read_access(server: str, kind: str) -> list[dict]:
+    if kind not in ACCESS_FILES:
+        raise HTTPException(400, "Unknown access list.")
+    path = safe_path(DATA_DIR, server, ACCESS_FILES[kind])
+    if not os.path.exists(path):
+        return []
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except (json.JSONDecodeError, OSError):
+        raise HTTPException(500, f"{ACCESS_FILES[kind]} is present but unreadable.")
+
+def _write_access(server: str, kind: str, rows: list[dict]) -> None:
+    path = safe_path(DATA_DIR, server, ACCESS_FILES[kind])
+    with open(path, "w") as f:
+        json.dump(rows, f, indent=2)
+
+def _offline_uuid(name: str) -> str:
+    """The UUID an offline-mode server derives from a username."""
+    import hashlib
+    digest = bytearray(hashlib.md5(f"OfflinePlayer:{name}".encode()).digest())
+    digest[6] = (digest[6] & 0x0f) | 0x30      # version 3
+    digest[8] = (digest[8] & 0x3f) | 0x80      # RFC 4122 variant
+    return str(uuid.UUID(bytes=bytes(digest)))
+
+def _mojang_uuid(name: str) -> str | None:
+    """Resolve a premium account's UUID. Returns None if offline or unknown."""
+    url = f"https://api.mojang.com/users/profiles/minecraft/{urllib.parse.quote(name)}"
+    req = urllib.request.Request(url, headers={"User-Agent": "MCServerClusterManager"})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            if resp.status != 200:
+                return None
+            raw = json.loads(resp.read().decode())
+    except Exception:
+        return None
+    hexid = (raw or {}).get("id", "")
+    if len(hexid) != 32:
+        return None
+    return str(uuid.UUID(hex=hexid))
+
+def _resolve_uuid(server: str, name: str) -> str:
+    """UUID for an offline edit, matching how this server assigns them."""
+    props = _parse_properties(server) or {}
+    if (props.get("online-mode", "true").lower() == "false"):
+        return _offline_uuid(name)
+    return _mojang_uuid(name) or _offline_uuid(name)
+
+# ---------------------------------------------------------------------------
+# Modrinth
+#
+# Proxied through the daemon rather than called from the page: it keeps the
+# browser on one origin, and the API wants a descriptive User-Agent.
+# ---------------------------------------------------------------------------
+MODRINTH_API = "https://api.modrinth.com/v2"
+
+def _modrinth_get(path: str, params: dict) -> dict:
+    url = f"{MODRINTH_API}{path}?{urllib.parse.urlencode(params)}"
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "MCServerClusterManager (self-hosted server manager)",
+        "Accept": "application/json",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return json.loads(resp.read().decode())
+    except urllib.error.HTTPError as exc:
+        raise HTTPException(502, f"Modrinth returned HTTP {exc.code}.")
+    except urllib.error.URLError as exc:
+        raise HTTPException(502, f"Could not reach Modrinth: {exc.reason}")
+    except Exception:
+        raise HTTPException(502, "Could not reach Modrinth.")
+
+# ---------------------------------------------------------------------------
 # Jobs / templates helpers
 # ---------------------------------------------------------------------------
 def _load_jobs_raw() -> list[dict]:
@@ -522,8 +971,151 @@ async def _execute_job(action: str, target: str) -> None:
             ts  = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
             out = os.path.join(BACKUP_DIR, f"{target}_{ts}.tar.gz")
             await asyncio.to_thread(subprocess.run, ["tar", "-czf", out, "-C", DATA_DIR, target], check=False)
+            pruned = await asyncio.to_thread(_prune_backups, target)
+            await notify("backup", f"💾 Scheduled snapshot of `{target}` complete"
+                                   + (f" ({len(pruned)} old archive(s) pruned)." if pruned else "."))
     elif action in ("start", "stop", "restart"):
+        # Tell the watchdog this one is on us, so a scheduled restart does not
+        # read as a crash on the next tick.
+        if action in ("stop", "restart"):
+            _mark_intentional(target)
         await asyncio.to_thread(_run, ["docker", action, target])
+
+# ---------------------------------------------------------------------------
+# Backup retention
+# ---------------------------------------------------------------------------
+# Archives are named "<server>_<YYYYmmdd>_<HHMMSS>.tar.gz"; the server name may
+# itself contain underscores, so the timestamp is matched from the right.
+_BACKUP_RE = re.compile(r'^(?P<server>.+)_(?P<stamp>\d{8}_\d{6})\.tar\.gz$')
+
+def _backup_entries() -> list[dict]:
+    rows = []
+    for fname in os.listdir(BACKUP_DIR):
+        if not fname.endswith(".tar.gz"):
+            continue
+        full = os.path.join(BACKUP_DIR, fname)
+        try:
+            st = os.stat(full)
+        except OSError:
+            continue
+        m = _BACKUP_RE.match(fname)
+        rows.append({
+            "name":   fname,
+            "server": m.group("server") if m else "",
+            "size":   st.st_size,
+            "human":  _human(st.st_size),
+            "mtime":  int(st.st_mtime),
+        })
+    rows.sort(key=lambda r: r["mtime"], reverse=True)
+    return rows
+
+def _prune_backups(server: str | None = None, settings: dict | None = None,
+                   dry_run: bool = False) -> list[str]:
+    """Delete archives outside the retention policy. Returns what went (or would).
+
+    Both rules are applied per server, not across the whole directory — one
+    noisy instance backing up hourly must not evict another's only copy.
+    """
+    s = settings or _load_settings()
+    if not s.get("backup_prune_enabled", True):
+        return []
+    keep_count = int(s.get("backup_keep_count", 0) or 0)
+    keep_days  = int(s.get("backup_keep_days", 0) or 0)
+    if keep_count <= 0 and keep_days <= 0:
+        return []
+
+    by_server: dict[str, list[dict]] = {}
+    for row in _backup_entries():
+        if server and row["server"] != server:
+            continue
+        by_server.setdefault(row["server"], []).append(row)
+
+    cutoff = time.time() - keep_days * 86400 if keep_days > 0 else None
+    removed: list[str] = []
+    for rows in by_server.values():
+        rows.sort(key=lambda r: r["mtime"], reverse=True)   # newest first
+        for idx, row in enumerate(rows):
+            too_many = keep_count > 0 and idx >= keep_count
+            too_old  = cutoff is not None and row["mtime"] < cutoff
+            if not (too_many or too_old):
+                continue
+            if dry_run:
+                removed.append(row["name"])
+                continue
+            try:
+                os.remove(os.path.join(BACKUP_DIR, row["name"]))
+                removed.append(row["name"])
+            except OSError:
+                pass
+    if removed and not dry_run:
+        audit("BACKUP_PRUNE", server or "all", f"removed={len(removed)}")
+    return removed
+
+# ---------------------------------------------------------------------------
+# server.properties revision history
+#
+# Every save writes the *previous* contents to a numbered revision first, so
+# rolling back is always possible even for a change made before this existed
+# (the first save after upgrading captures the original).
+# ---------------------------------------------------------------------------
+PROP_HISTORY_KEEP = 25
+
+def _prop_history_dir(name: str) -> str:
+    path = safe_path(PROP_HISTORY_DIR, name)
+    os.makedirs(path, exist_ok=True)
+    return path
+
+def _snapshot_properties(name: str, note: str = "") -> str | None:
+    """Copy the current server.properties into the revision store."""
+    current = _parse_properties(name)
+    if current is None:
+        return None
+    hist_dir = _prop_history_dir(name)
+    stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = os.path.join(hist_dir, f"{stamp}.json")
+    # Two saves inside the same second would collide on the filename.
+    suffix = 1
+    while os.path.exists(path):
+        path = os.path.join(hist_dir, f"{stamp}-{suffix}.json")
+        suffix += 1
+    with open(path, "w") as f:
+        json.dump({"saved": time.time(), "note": note, "props": current}, f, indent=2)
+
+    # Oldest first by write time, not by name: two saves inside one second
+    # differ only by a "-N" suffix, which sorts before the plain name.
+    revisions = sorted(
+        (f for f in os.listdir(hist_dir) if f.endswith(".json")),
+        key=lambda f: os.path.getmtime(os.path.join(hist_dir, f)))
+    for stale in revisions[:-PROP_HISTORY_KEEP]:
+        try:
+            os.remove(os.path.join(hist_dir, stale))
+        except OSError:
+            pass
+    return os.path.basename(path)
+
+def _load_revision(name: str, rev: str) -> dict:
+    if not re.match(r'^\d{8}_\d{6}(-\d+)?\.json$', rev):
+        raise HTTPException(400, "Invalid revision id.")
+    path = os.path.join(_prop_history_dir(name), rev)
+    if not os.path.exists(path):
+        raise HTTPException(404, "Revision not found.")
+    with open(path) as f:
+        return json.load(f)
+
+def _diff_props(old: dict, new: dict) -> list[dict]:
+    """Key-level diff: what a rollback would actually change."""
+    rows = []
+    for key in sorted(set(old) | set(new)):
+        before, after = old.get(key), new.get(key)
+        if before == after:
+            continue
+        rows.append({
+            "key": key,
+            "before": before,
+            "after": after,
+            "change": "added" if before is None else "removed" if after is None else "changed",
+        })
+    return rows
 
 # ---------------------------------------------------------------------------
 # REST — Servers
@@ -1022,10 +1614,20 @@ async def server_action(request: Request, name: str = Path(...)):
     action = data.get("action")
     if action not in ("start", "stop", "restart", "kill", "delete"):
         raise HTTPException(400, "Invalid action.")
+    # Anything that takes the container down on purpose must not look like a
+    # crash to the watchdog on its next tick.
+    if action in ("stop", "restart", "kill", "delete"):
+        _mark_intentional(name)
     cmd = ["docker", "rm", "-f", name] if action == "delete" else ["docker", action, name]
     code, _, err = _run(cmd)
     if code != 0:
+        _intentional_stops.discard(name)
         raise HTTPException(500, f"Docker error: {err}")
+    if action == "delete":
+        _metrics.pop(name, None)
+        _container_prev_state.pop(name, None)
+        _restart_history.pop(name, None)
+        _intentional_stops.discard(name)
     audit("ACTION", name, f"action={action}")
     return JSONResponse({"message": f"Container '{name}' → {action}."})
 
@@ -1090,24 +1692,348 @@ async def get_properties(name: str = Path(...)):
         raise HTTPException(404, "server.properties not found yet.")
     return JSONResponse(props)
 
-@app.post("/api/server/{name}/properties/save")
-async def save_properties(request: Request, name: str = Path(...)):
-    validate_name(name)
-    data     = await request.json()
+def _write_properties(name: str, data: dict, note: str) -> tuple[int, str | None]:
+    """Snapshot the current file, then write the new one. Returns (keys, rev)."""
     filepath = safe_path(DATA_DIR, name, "server.properties")
     dir_path = os.path.dirname(filepath)
     if not os.path.exists(dir_path):
         raise HTTPException(404, "Server data directory missing.")
 
+    rev = _snapshot_properties(name, note)
+
     lines = [f"# Updated via Cluster Manager\n# {datetime.datetime.now().isoformat()}\n"]
+    written = 0
     for k, v in data.items():
         safe_k = _sanitize_prop_key(k)
         if safe_k is None: continue
         lines.append(f"{safe_k}={_sanitize_prop_val(v)}\n")
+        written += 1
 
     with open(filepath, "w") as f: f.writelines(lines)
-    audit("PROPS_SAVE", name, f"keys={len(lines)-2}")
-    return JSONResponse({"message": "Properties saved."})
+    return written, rev
+
+@app.post("/api/server/{name}/properties/save")
+async def save_properties(request: Request, name: str = Path(...)):
+    validate_name(name)
+    data = await request.json()
+    before = _parse_properties(name) or {}
+    written, rev = _write_properties(name, data, "manual save")
+    changed = _diff_props(before, _parse_properties(name) or {})
+    audit("PROPS_SAVE", name, f"keys={written} changed={len(changed)}")
+    return JSONResponse({
+        "message": "Properties saved." if changed
+                   else "Properties saved — nothing actually changed.",
+        "changed": changed,
+        "revision": rev,
+    })
+
+@app.get("/api/server/{name}/properties/history")
+async def properties_history(name: str = Path(...)):
+    validate_name(name)
+    hist_dir = _prop_history_dir(name)
+    current  = _parse_properties(name) or {}
+    rows = []
+    for fname in (f for f in os.listdir(hist_dir) if f.endswith(".json")):
+        try:
+            with open(os.path.join(hist_dir, fname)) as f:
+                rec = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            continue
+        props = rec.get("props", {})
+        rows.append({
+            "id":      fname,
+            "saved":   rec.get("saved", 0),
+            "note":    rec.get("note", ""),
+            "keys":    len(props),
+            # How far this revision sits from what is on disk right now.
+            "changes": len(_diff_props(props, current)),
+        })
+    # Newest first by recorded time — filenames tie on same-second saves.
+    rows.sort(key=lambda r: r["saved"], reverse=True)
+    return JSONResponse({"revisions": rows, "current_keys": len(current)})
+
+@app.get("/api/server/{name}/properties/history/{rev}")
+async def properties_revision(name: str = Path(...), rev: str = Path(...)):
+    validate_name(name)
+    rec = _load_revision(name, rev)
+    current = _parse_properties(name) or {}
+    # Direction reads as "what applying this revision would do to the file".
+    return JSONResponse({
+        "id": rev,
+        "saved": rec.get("saved", 0),
+        "note": rec.get("note", ""),
+        "props": rec.get("props", {}),
+        "diff": _diff_props(current, rec.get("props", {})),
+    })
+
+@app.post("/api/server/{name}/properties/rollback")
+async def properties_rollback(request: Request, name: str = Path(...)):
+    validate_name(name)
+    data = await request.json()
+    rev  = data.get("revision", "")
+    rec  = _load_revision(name, rev)
+    props = rec.get("props", {})
+    if not props:
+        raise HTTPException(400, "That revision holds no properties.")
+    before = _parse_properties(name) or {}
+    diff = _diff_props(before, props)
+    # The rollback itself is snapshotted, so it can be undone in turn.
+    written, new_rev = _write_properties(name, props, f"rollback to {rev}")
+    audit("PROPS_ROLLBACK", name, f"rev={rev} keys={written} changed={len(diff)}")
+    return JSONResponse({
+        "message": f"Rolled back to {rev} — {len(diff)} key(s) changed. "
+                   "Restart the server for it to take effect.",
+        "changed": diff,
+        "revision": new_rev,
+    })
+
+# ---------------------------------------------------------------------------
+# REST — Player moderation
+# ---------------------------------------------------------------------------
+@app.post("/api/server/{name}/player/action")
+async def player_action(request: Request, name: str = Path(...)):
+    validate_name(name)
+    data   = await request.json()
+    player = _validate_player(data.get("player", ""))
+    action = data.get("action", "")
+    arg    = data.get("arg", "")
+
+    command = _player_command(action, player, arg)
+    if not await asyncio.to_thread(_is_running, name):
+        raise HTTPException(409, f"'{name}' is not running — RCON commands need a live server.")
+
+    code, out, err = await asyncio.to_thread(_rcon, name, command)
+    if code != 0:
+        raise HTTPException(502, f"RCON failed: {(err or out or 'no response')[:200]}")
+    audit("PLAYER_ACTION", name, f"action={action} player={player}")
+    return JSONResponse({
+        "message": (out or f"{action} sent for {player}.").strip(),
+        "command": command,
+    })
+
+# ---------------------------------------------------------------------------
+# REST — Access lists (whitelist / ops / bans)
+# ---------------------------------------------------------------------------
+@app.get("/api/server/{name}/access/{kind}")
+async def access_list(name: str = Path(...), kind: str = Path(...)):
+    validate_name(name)
+    rows = await asyncio.to_thread(_read_access, name, kind)
+    return JSONResponse({
+        "kind": kind,
+        "entries": rows,
+        "running": await asyncio.to_thread(_is_running, name),
+        "file": ACCESS_FILES.get(kind, ""),
+    })
+
+@app.post("/api/server/{name}/access/{kind}")
+async def access_edit(request: Request, name: str = Path(...), kind: str = Path(...)):
+    """Add or remove one entry, live over RCON when the server is up."""
+    validate_name(name)
+    if kind not in ACCESS_FILES:
+        raise HTTPException(400, "Unknown access list.")
+    data   = await request.json()
+    op     = data.get("op", "")
+    target = (data.get("value", "") or "").strip()
+    reason = _clean_reason(data.get("reason", ""))
+    if op not in ("add", "remove"):
+        raise HTTPException(400, "op must be 'add' or 'remove'.")
+
+    if kind == "banned-ips":
+        if not _IP_RE.match(target):
+            raise HTTPException(400, "Invalid IP address.")
+    else:
+        _validate_player(target)
+
+    running = await asyncio.to_thread(_is_running, name)
+
+    if running:
+        command = {
+            ("whitelist", "add"):         f"whitelist add {target}",
+            ("whitelist", "remove"):      f"whitelist remove {target}",
+            ("ops", "add"):               f"op {target}",
+            ("ops", "remove"):            f"deop {target}",
+            ("banned-players", "add"):    f"ban {target} {reason}".strip(),
+            ("banned-players", "remove"): f"pardon {target}",
+            ("banned-ips", "add"):        f"ban-ip {target} {reason}".strip(),
+            ("banned-ips", "remove"):     f"pardon-ip {target}",
+        }[(kind, op)]
+        code, out, err = await asyncio.to_thread(_rcon, name, command)
+        if code != 0:
+            raise HTTPException(502, f"RCON failed: {(err or out or 'no response')[:200]}")
+        audit("ACCESS_EDIT", name, f"{kind} {op} {target} (rcon)")
+        return JSONResponse({"message": (out or f"{op} applied.").strip(), "via": "rcon"})
+
+    # Offline edit. Removal only needs the name; adding needs a UUID, which the
+    # running server would normally resolve for us.
+    rows = await asyncio.to_thread(_read_access, name, kind)
+    key  = "ip" if kind == "banned-ips" else "name"
+    if op == "remove":
+        kept = [r for r in rows if str(r.get(key, "")).lower() != target.lower()]
+        if len(kept) == len(rows):
+            raise HTTPException(404, f"'{target}' is not on that list.")
+        await asyncio.to_thread(_write_access, name, kind, kept)
+        audit("ACCESS_EDIT", name, f"{kind} remove {target} (file)")
+        return JSONResponse({"message": f"Removed '{target}' from {kind}.", "via": "file"})
+
+    if any(str(r.get(key, "")).lower() == target.lower() for r in rows):
+        raise HTTPException(409, f"'{target}' is already on that list.")
+
+    now = datetime.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %z")
+    if kind == "banned-ips":
+        entry = {"ip": target, "created": now, "source": "Cluster Manager",
+                 "expires": "forever", "reason": reason or "Banned by an operator."}
+    else:
+        resolved = await asyncio.to_thread(_resolve_uuid, name, target)
+        entry = {"uuid": resolved, "name": target}
+        if kind == "ops":
+            props = _parse_properties(name) or {}
+            try:
+                level = int(props.get("op-permission-level", "4"))
+            except ValueError:
+                level = 4
+            entry.update({"level": level, "bypassesPlayerLimit": False})
+        elif kind == "banned-players":
+            entry.update({"created": now, "source": "Cluster Manager",
+                          "expires": "forever", "reason": reason or "Banned by an operator."})
+    rows.append(entry)
+    await asyncio.to_thread(_write_access, name, kind, rows)
+    audit("ACCESS_EDIT", name, f"{kind} add {target} (file)")
+    return JSONResponse({
+        "message": f"Added '{target}' to {kind}. It applies next time the server starts.",
+        "via": "file",
+    })
+
+# ---------------------------------------------------------------------------
+# REST — Metrics history
+# ---------------------------------------------------------------------------
+def _series(name: str, since: int | None) -> list[dict]:
+    rows = list(_metrics.get(name, ()))
+    if since:
+        rows = [r for r in rows if r["t"] >= since]
+    return rows
+
+@app.get("/api/metrics")
+async def metrics_cluster(minutes: int = 60):
+    """Every sampled server, for the cluster graphs."""
+    minutes = max(1, min(minutes, 720))
+    since   = int(time.time()) - minutes * 60
+    known   = {c["name"]: c["status"] for c in _get_containers()}
+    out = []
+    for name in sorted(set(_metrics) | set(known)):
+        rows = _series(name, since)
+        live = [r for r in rows if r["cpu"] is not None]
+        out.append({
+            "server":  name,
+            "status":  known.get(name, "unknown"),
+            "samples": rows,
+            "cpu_avg": round(sum(r["cpu"] for r in live) / len(live), 2) if live else None,
+            "cpu_max": max((r["cpu"] for r in live), default=None),
+            "mem_max": max((r["mem_mb"] for r in live if r["mem_mb"] is not None), default=None),
+        })
+    return JSONResponse({
+        "interval": METRICS_INTERVAL, "minutes": minutes, "servers": out,
+    })
+
+@app.get("/api/server/{name}/metrics")
+async def metrics_one(name: str = Path(...), minutes: int = 60):
+    validate_name(name)
+    minutes = max(1, min(minutes, 720))
+    return JSONResponse({
+        "server": name, "interval": METRICS_INTERVAL, "minutes": minutes,
+        "samples": _series(name, int(time.time()) - minutes * 60),
+    })
+
+# ---------------------------------------------------------------------------
+# REST — Settings (retention, watchdog, notifications)
+# ---------------------------------------------------------------------------
+@app.get("/api/settings")
+async def get_settings():
+    return JSONResponse(_load_settings())
+
+@app.post("/api/settings")
+async def post_settings(request: Request):
+    raw = await request.json()
+    if not isinstance(raw, dict):
+        raise HTTPException(400, "Expected a settings object.")
+    merged = _coerce_settings(raw)
+    async with _settings_lock:
+        await asyncio.to_thread(_save_settings, merged)
+    audit("SETTINGS_SAVE", "system", f"keys={len(raw)}")
+    return JSONResponse({"message": "Settings saved.", "settings": merged})
+
+@app.post("/api/settings/test-webhook")
+async def test_webhook():
+    s = _load_settings()
+    if not (s.get("webhook_url") or "").strip():
+        raise HTTPException(400, "No webhook URL is configured.")
+    ok = await asyncio.to_thread(
+        _notify_blocking, "🔔 Test notification from Cluster Manager.", s)
+    if not ok:
+        raise HTTPException(502, "The webhook did not accept the message.")
+    return JSONResponse({"message": "Test notification delivered."})
+
+# ---------------------------------------------------------------------------
+# REST — Modrinth search
+# ---------------------------------------------------------------------------
+# Modrinth tags a project by loader, and for the server flavours that share the
+# Bukkit plugin API the tag is the flavour's own name.
+_MODRINTH_LOADERS = {
+    "FABRIC": "fabric", "FORGE": "forge", "NEOFORGE": "neoforge", "QUILT": "quilt",
+    "PAPER": "paper", "SPIGOT": "spigot", "BUKKIT": "bukkit", "PURPUR": "purpur",
+    "FOLIA": "folia", "VELOCITY": "velocity", "BUNGEECORD": "bungeecord",
+}
+
+@app.get("/api/server/{name}/runtime")
+async def server_runtime(name: str = Path(...)):
+    """What this instance actually runs — used to scope a Modrinth search."""
+    validate_name(name)
+    env = await asyncio.to_thread(_docker_env, name)
+    stype = (env.get("TYPE", "") or "").upper()
+    version = env.get("VERSION", "") or ""
+    return JSONResponse({
+        "type": stype,
+        "version": version,
+        "loader": _MODRINTH_LOADERS.get(stype, ""),
+        # A plugin server wants plugins; a mod loader wants mods.
+        "project_type": "plugin" if stype in ("PAPER", "SPIGOT", "BUKKIT", "PURPUR", "FOLIA")
+                        else "mod",
+    })
+@app.get("/api/modrinth/search")
+async def modrinth_search(q: str = "", loader: str = "", version: str = "",
+                          project_type: str = "mod", limit: int = 20):
+    facets: list[list[str]] = []
+    if project_type in ("mod", "plugin", "datapack", "modpack", "resourcepack", "shader"):
+        facets.append([f"project_type:{project_type}"])
+    if loader:
+        loader = loader.lower()
+        if not re.match(r'^[a-z]{2,16}$', loader):
+            raise HTTPException(400, "Invalid loader.")
+        facets.append([f"categories:{loader}"])
+    if version:
+        if not re.match(r'^[\w.\-]{1,24}$', version):
+            raise HTTPException(400, "Invalid game version.")
+        facets.append([f"versions:{version}"])
+
+    params = {"query": q[:120], "limit": max(1, min(limit, 50)), "index": "relevance"}
+    if facets:
+        params["facets"] = json.dumps(facets)
+
+    raw = await asyncio.to_thread(_modrinth_get, "/search", params)
+    hits = []
+    for h in (raw.get("hits") or []):
+        hits.append({
+            "slug":        h.get("slug", ""),
+            "title":       h.get("title", ""),
+            "description": (h.get("description") or "")[:240],
+            "author":      h.get("author", ""),
+            "downloads":   h.get("downloads", 0),
+            "icon_url":    h.get("icon_url") or "",
+            "categories":  (h.get("categories") or [])[:6],
+            "versions":    (h.get("versions") or [])[-6:],
+            "server_side": h.get("server_side", "unknown"),
+            "client_side": h.get("client_side", "unknown"),
+        })
+    return JSONResponse({"hits": hits, "total": raw.get("total_hits", len(hits))})
 
 # ---------------------------------------------------------------------------
 # REST — Addons
@@ -1225,16 +2151,52 @@ async def trigger_backup(name: str = Path(...)):
     code, _, err = _run(["tar", "-czf", backup_file, "-C", DATA_DIR, name])
     if code != 0:
         raise HTTPException(500, f"tar failed: {err}")
+    pruned = await asyncio.to_thread(_prune_backups, name)
     audit("BACKUP", name, f"file={os.path.basename(backup_file)}")
-    return JSONResponse({"message": f"Snapshot created: {os.path.basename(backup_file)}"})
+    await notify("backup", f"💾 Snapshot of `{name}` captured.")
+    msg = f"Snapshot created: {os.path.basename(backup_file)}"
+    if pruned:
+        msg += f" — {len(pruned)} old archive(s) pruned."
+    return JSONResponse({"message": msg, "pruned": pruned})
 
 @app.get("/api/backups")
 async def list_backups():
-    files = sorted(
-        (f for f in os.listdir(BACKUP_DIR) if f.endswith(".tar.gz")),
-        reverse=True,
-    )
-    return JSONResponse({"backups": files})
+    rows  = _backup_entries()
+    total = sum(r["size"] for r in rows)
+    return JSONResponse({
+        # Plain filenames kept for anything still reading the old shape.
+        "backups": [r["name"] for r in rows],
+        "entries": rows,
+        "total": total,
+        "total_human": _human(total),
+        "settings": {k: _load_settings()[k] for k in
+                     ("backup_keep_count", "backup_keep_days", "backup_prune_enabled")},
+    })
+
+@app.delete("/api/backups/{filename}")
+async def delete_backup(filename: str = Path(...)):
+    if not filename.endswith(".tar.gz") or "/" in filename or "\\" in filename:
+        raise HTTPException(400, "Invalid backup filename.")
+    path = os.path.join(BACKUP_DIR, filename)
+    if not os.path.exists(path):
+        raise HTTPException(404, "Backup not found.")
+    try:
+        os.remove(path)
+    except OSError as exc:
+        raise HTTPException(500, f"Could not delete: {exc}")
+    audit("BACKUP_DELETE", "system", f"file={filename}")
+    return JSONResponse({"message": f"Deleted {filename}."})
+
+@app.post("/api/backups/prune")
+async def prune_backups(request: Request):
+    data    = await request.json() if await request.body() else {}
+    dry_run = bool(data.get("dry_run", False))
+    removed = await asyncio.to_thread(_prune_backups, data.get("server") or None, None, dry_run)
+    if not removed:
+        return JSONResponse({"message": "Nothing to prune — everything is inside the policy.",
+                             "removed": []})
+    verb = "would be removed" if dry_run else "removed"
+    return JSONResponse({"message": f"{len(removed)} archive(s) {verb}.", "removed": removed})
 
 @app.post("/api/server/{name}/restore")
 async def restore_backup(request: Request, name: str = Path(...)):
@@ -1341,6 +2303,8 @@ async def create_job(request: Request):
 
 @app.delete("/api/jobs/{job_id}")
 async def delete_job(job_id: str = Path(...)):
+    if job_id in SYSTEM_JOB_IDS:
+        raise HTTPException(400, "That is an internal job and cannot be removed.")
     async with _jobs_lock:
         jobs = [j for j in _load_jobs_raw() if j["id"] != job_id]
         _save_jobs_raw(jobs)
@@ -2077,6 +3041,10 @@ async def ws_endpoint(websocket: WebSocket):
                         m = re.search(r'players online:\s*(.*)', out, re.IGNORECASE)
                         if m and m.group(1).strip():
                             players = [p.strip() for p in m.group(1).split(",") if p.strip()]
+                    if code == 0:
+                        # Free data point — the sampler stays RCON-free on purpose,
+                        # so this is the only place a player count comes from.
+                        _record_players(target, len(players))
                     await safe_send({"type": "player_list", "players": players})
 
             elif method == "player:data":

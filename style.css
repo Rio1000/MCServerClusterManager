@@ -1013,6 +1013,29 @@ code {
 /* ===========================================================================
    Console
    =========================================================================== */
+.console-box.hide-noise .term-noise,
+.console-box .term-filtered {
+  display: none;
+}
+
+.console-filter {
+  display: flex;
+  gap: var(--s2);
+  align-items: center;
+  margin-bottom: var(--s2);
+}
+
+.console-filter .mc-input {
+  flex: 1;
+  min-width: 0;
+}
+
+.muted-count {
+  align-self: center;
+  font-size: var(--t-sm);
+  color: var(--ink-faint);
+}
+
 .console-box {
   background: #000;
   border: 3px solid var(--btn-dark);
@@ -1404,12 +1427,94 @@ code {
   white-space: pre;
 }
 
-/* NBT syntax colours */
+/* ---------------------------------------------------------------------------
+   NBT tree
+   The modal renders parsed NBT as nested <details>, so the wall of text from
+   `data get entity` becomes something you can actually walk through. Raw mode
+   reuses the same box with white-space: pre.
+   --------------------------------------------------------------------------- */
+.modal-content.nbt-tree {
+  white-space: normal;
+}
+
 .nbt-key { color: var(--mc-yellow); }
-.nbt-bracket { color: var(--mc-gray); font-weight: bold; }
-.nbt-string { color: var(--mc-red); }
 .nbt-num { color: var(--mc-green); }
 .nbt-bool { color: var(--mc-cyan); }
+.nbt-str { color: #ff9f6e; }
+.nbt-dim { color: var(--mc-gray); font-style: italic; }
+
+.nbt-node > summary {
+  cursor: pointer;
+  padding: 1px 0;
+  list-style: none;
+  display: flex;
+  align-items: baseline;
+  gap: var(--s2);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.nbt-node > summary::-webkit-details-marker { display: none; }
+
+.nbt-node > summary::before {
+  content: "▸";
+  color: var(--mc-gray);
+  flex-shrink: 0;
+  width: 10px;
+}
+
+.nbt-node[open] > summary::before { content: "▾"; }
+
+.nbt-node > summary:hover {
+  background: rgba(255, 255, 255, .07);
+}
+
+.nbt-children {
+  margin-left: 14px;
+  padding-left: var(--s2);
+  border-left: 1px dotted #4a4a4a;
+}
+
+.nbt-leaf {
+  display: flex;
+  align-items: baseline;
+  gap: var(--s2);
+  padding: 1px 0 1px 14px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.nbt-leaf .nbt-key::after,
+.nbt-node > summary .nbt-key::after {
+  content: ":";
+  color: var(--mc-gray);
+}
+
+.nbt-type {
+  color: #7fa7d4;
+  font-size: var(--t-xs);
+  flex-shrink: 0;
+}
+
+.nbt-count {
+  color: var(--mc-gray);
+  font-size: var(--t-xs);
+  flex-shrink: 0;
+}
+
+.nbt-preview {
+  color: #9a9a9a;
+  font-size: var(--t-xs);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.modal-title .title-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--s1);
+}
 
 /* ===========================================================================
    Toasts
@@ -1856,3 +1961,284 @@ body.no-target .needs-target {
     display: none;
   }
 }
+
+/* ===========================================================================
+   Charts — overview sparklines and cluster load graphs
+
+   Paths are generated in a fixed 600-unit viewBox and stretched by CSS, so
+   preserveAspectRatio is off and strokes carry non-scaling-stroke to stop the
+   horizontal stretch from thickening them.
+   =========================================================================== */
+.spark-stack,
+.graph-stack {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s3);
+}
+
+.spark-block,
+.graph-card {
+  background: var(--group-bg);
+  border-top: 2px solid var(--group-edge-lt);
+  border-left: 2px solid var(--group-edge-lt);
+  border-right: 2px solid var(--group-edge-dk);
+  border-bottom: 2px solid var(--group-edge-dk);
+  padding: var(--s2);
+}
+
+.graph-card.dim {
+  opacity: .62;
+}
+
+.spark-head,
+.graph-head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--s2);
+  margin-bottom: var(--s1);
+}
+
+.spark-title {
+  font-size: var(--t-sm);
+  color: var(--ink-heading);
+  text-shadow: 1px 1px var(--emboss-soft);
+}
+
+.spark-stats {
+  margin-left: auto;
+  display: flex;
+  gap: var(--s3);
+  font-size: var(--t-xs);
+  color: var(--ink-faint);
+}
+
+.spark-stats b {
+  color: var(--ink);
+  font-weight: normal;
+}
+
+.chart {
+  display: block;
+  width: 100%;
+  height: 60px;
+  background: var(--meter-track);
+  border: 2px solid var(--btn-dark);
+}
+
+.graph-card .chart {
+  height: 76px;
+}
+
+.chart-grid {
+  stroke: var(--scroll-thumb);
+  stroke-width: 1;
+  stroke-dasharray: 3 4;
+  vector-effect: non-scaling-stroke;
+  opacity: .5;
+}
+
+.chart-empty {
+  font-size: var(--t-xs);
+  font-style: italic;
+  color: var(--ink-faint);
+  padding: var(--s3) var(--s2);
+  text-align: center;
+  background: var(--meter-track);
+  border: 2px solid var(--btn-dark);
+  color: var(--mc-gray);
+}
+
+/* VT323 sits high in its em box, so text-decoration: underline draws through
+   the glyphs. A bottom border clears them. */
+.graph-name {
+  font-family: inherit;
+  font-size: var(--t-md);
+  background: none;
+  border: none;
+  border-bottom: 1px dotted var(--ink-faint);
+  padding: 0 0 2px;
+  cursor: pointer;
+  color: var(--ink);
+  text-shadow: 1px 1px var(--emboss-soft);
+}
+
+.graph-name:hover {
+  color: var(--ok-ink);
+  border-bottom-color: var(--ok-ink);
+}
+
+/* ===========================================================================
+   Action rows — player moderation, access lists, Modrinth filters
+   =========================================================================== */
+.act-row {
+  display: flex;
+  gap: var(--s2);
+  align-items: center;
+  flex-wrap: wrap;
+  margin-bottom: var(--s2);
+}
+
+.act-row .mc-input,
+.act-row .mc-select {
+  flex: 1;
+  min-width: 120px;
+}
+
+.act-row .mc-btn {
+  flex-shrink: 0;
+}
+
+.check-line {
+  display: flex;
+  align-items: center;
+  gap: var(--s2);
+  font-size: var(--t-sm);
+  color: var(--ink);
+  padding: var(--s1) 0;
+  cursor: pointer;
+}
+
+.p-acts {
+  display: flex;
+  gap: var(--s1);
+  flex-shrink: 0;
+  flex-wrap: wrap;
+}
+
+.scroll-box.tall {
+  max-height: 340px;
+}
+
+/* ===========================================================================
+   Properties diff
+   =========================================================================== */
+.prop-diff {
+  margin-top: var(--s3);
+  border-top: 2px solid var(--divider);
+  padding-top: var(--s2);
+}
+
+.diff-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 320px;
+  overflow-y: auto;
+}
+
+.diff-row {
+  display: grid;
+  grid-template-columns: minmax(120px, 1.2fr) minmax(60px, 1fr) 16px minmax(60px, 1fr);
+  align-items: baseline;
+  gap: var(--s2);
+  font-size: var(--t-xs);
+  padding: 3px var(--s1);
+  border-left: 4px solid transparent;
+  background: var(--slot-bg);
+}
+
+.diff-row .diff-key {
+  color: var(--ink);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.diff-before {
+  color: var(--err-ink);
+  text-decoration: line-through;
+  /* Break only when a value genuinely cannot fit, so an MOTD wraps at spaces
+     rather than mid-word. */
+  overflow-wrap: anywhere;
+}
+
+.diff-after {
+  color: var(--ok-ink);
+  /* Break only when a value genuinely cannot fit, so an MOTD wraps at spaces
+     rather than mid-word. */
+  overflow-wrap: anywhere;
+}
+
+.diff-arrow {
+  color: var(--ink-faint);
+  text-align: center;
+}
+
+.diff-changed { border-left-color: var(--warn-ink); }
+.diff-added   { border-left-color: var(--ok-ink); }
+.diff-removed { border-left-color: var(--err-ink); }
+
+/* ===========================================================================
+   Modrinth search results
+   =========================================================================== */
+.mr-row {
+  display: flex;
+  align-items: center;
+  gap: var(--s2);
+  padding: var(--s2) 2px;
+  border-bottom: 1px dashed var(--divider-dash);
+}
+
+.mr-row:last-child {
+  border-bottom: none;
+}
+
+.mr-icon {
+  width: 38px;
+  height: 38px;
+  flex-shrink: 0;
+  object-fit: cover;
+  background: var(--slot-bg);
+  border: 2px solid var(--slot-edge-dk);
+  image-rendering: pixelated;
+}
+
+.mr-icon-blank {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--ink-faint);
+}
+
+.mr-main {
+  flex: 1;
+  min-width: 0;
+}
+
+.mr-title {
+  font-size: var(--t-sm);
+  color: var(--ink);
+  display: flex;
+  align-items: baseline;
+  gap: var(--s2);
+  flex-wrap: wrap;
+}
+
+.mr-slug {
+  font-size: var(--t-xs);
+  color: var(--ink-faint);
+}
+
+.mr-desc {
+  font-size: var(--t-xs);
+  color: var(--ink-soft);
+  line-height: 1.45;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.mr-meta {
+  display: flex;
+  gap: var(--s3);
+  flex-wrap: wrap;
+  font-size: var(--t-xs);
+  color: var(--ink-faint);
+  margin-top: 2px;
+}
+
+.mr-warn {
+  color: var(--warn-ink);
+}
+
