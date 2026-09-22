@@ -820,7 +820,7 @@ function sw(id, el) {
 
   // Auto-fetch on panel open
   if (id === 'automation') { loadBackups(); loadJobs(); loadSettings(); }
-  if (id === 'mods') { loadInstalledAddons(); refreshPackwizStatus(); seedModrinthFilters(); }
+  if (id === 'mods') { loadInstalledAddons(); refreshPackwizStatus(); seedModrinthFilters(); loadPackState(); }
   if (id === 'players') { requestPlayerList(); loadAccessList(); }
   if (id === 'files') { fmReload(); }
   if (id === 'cluster') { loadClusterMetrics(); }
@@ -2412,6 +2412,7 @@ async function setupPackwiz() {
   logTerm(d.message || 'Packwiz ready.');
   toast(d.message || 'Packwiz ready.', 'ok');
   refreshPackwizStatus();
+  loadPackState();
 }
 
 async function runPackwiz(action) {
@@ -2427,11 +2428,76 @@ async function runPackwiz(action) {
     const data = res ? await res.json().catch(() => ({})) : {};
     logTerm(data.detail || 'Packwiz request failed.', true);
     toast(data.detail || 'Packwiz failed.', 'error');
+    loadPackState();
     return;
   }
   const data = await res.json().catch(() => ({}));
   logTerm(data.message || data.error || '', !!data.error);
   toast(data.message || `Packwiz ${action} done.`, 'ok');
+  loadInstalledAddons();
+  loadPackState();
+}
+
+// ---------------------------------------------------------------------------
+// Pack contents — metadata vs jars actually on disk
+//
+// packwiz writes a .pw.toml per mod and downloads nothing, so a pack can look
+// complete in the registry while the server has no jars to load. This surfaces
+// that gap and offers to close it.
+// ---------------------------------------------------------------------------
+async function loadPackState() {
+  if (!activeServer) return;
+  const el = document.getElementById('pack-state');
+  const btn = document.getElementById('btn-pack-sync');
+  if (!el || !btn) return;
+
+  const res = await fetch(`/api/server/${activeServer}/packwiz/state`).catch(() => null);
+  if (!res || !res.ok) {
+    el.innerHTML = '<span class="err">Could not read the pack.</span>';
+    btn.disabled = true;
+    return;
+  }
+  const d = await res.json().catch(() => ({}));
+
+  if (!d.total) {
+    el.textContent = d.has_pack
+      ? 'Pack initialised, no mods in it yet.'
+      : 'No packwiz pack on this server yet.';
+    btn.disabled = true;
+    return;
+  }
+
+  const missing = d.missing || 0;
+  btn.disabled = missing === 0;
+  btn.textContent = missing
+    ? `DOWNLOAD ${missing} MISSING JAR${missing === 1 ? '' : 'S'}`
+    : 'ALL JARS PRESENT';
+  el.innerHTML = missing
+    ? `<span class="err">${d.total} mod(s) in the pack, ${missing} with no jar on disk —`
+      + ' the server cannot load those.</span>'
+    : `<span class="ok">${d.total} mod(s) in the pack, all present.</span>`;
+}
+
+async function syncPack() {
+  if (!activeServer) { toast('Select a server first.', 'error'); return; }
+  const btn = document.getElementById('btn-pack-sync');
+  const label = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = 'DOWNLOADING…';
+  logTerm(`Syncing packwiz pack for ${activeServer}...`);
+
+  const data = await apiCall(`/api/server/${activeServer}/packwiz/sync`, { method: 'POST' });
+  btn.textContent = label;
+
+  if (!data) { loadPackState(); return; }
+  const r = data.report || {};
+  (r.downloaded || []).forEach(d => logTerm(`  + ${d.file}`));
+  (r.skipped || []).forEach(s => logTerm(`  · ${s.name} — ${s.why}`));
+  (r.failed || []).forEach(f => logTerm(`  ! ${f.name} — ${f.why}`, true));
+  logTerm(data.message);
+  toast(data.message, (r.failed || []).length ? 'error' : 'ok');
+  loadInstalledAddons();
+  loadPackState();
 }
 
 // ---------------------------------------------------------------------------

@@ -607,6 +607,14 @@
                 <button id="btn-packwiz-setup" class="mc-btn green block" onclick="setupPackwiz()">
                   SET UP PACKWIZ FOR THIS SERVER</button>
 
+                <h4 class="section-heading">Pack Contents</h4>
+                <p class="card-hint">packwiz records what a pack should contain; the jars have to
+                  be fetched separately. Adding a mod here does both, but a pack built elsewhere —
+                  or before this manager downloaded anything — needs a sync.</p>
+                <div id="pack-state" class="status-line">Checking the pack&hellip;</div>
+                <button id="btn-pack-sync" class="mc-btn block" onclick="syncPack()">
+                  DOWNLOAD MISSING JARS</button>
+
                 <h4 class="section-heading">Modrinth</h4>
                 <div class="field">
                   <label class="field-lbl" for="mod-slug">Modrinth Slug</label>

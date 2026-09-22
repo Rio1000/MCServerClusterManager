@@ -959,6 +959,193 @@ def _seed_packwizignore(server_path: str) -> bool:
     return True
 
 
+# ---------------------------------------------------------------------------
+# Resolving a packwiz pack into actual jars
+#
+# `packwiz modrinth add` writes a metadata file — mods/fabric-api.pw.toml —
+# recording where the jar lives and what it should hash to. It never downloads
+# anything. A pack is normally materialised by a second tool (packwiz-installer,
+# or the itzg image when PACKWIZ_URL is set), and without that step the server
+# starts with a mods folder full of .toml files it cannot load.
+#
+# Rather than add a Java bootstrap or require the pack be served over HTTP,
+# this reads the metadata and fetches the jars directly. Every download is
+# checked against the hash in the file it came from.
+# ---------------------------------------------------------------------------
+MOD_DOWNLOAD_MAX   = 512 * 1024 * 1024
+MOD_DOWNLOAD_CHUNK = 256 * 1024
+
+# Where a pack file is allowed to point. The hash check is what guarantees
+# integrity; this is here so a hand-edited .pw.toml cannot aim the daemon at
+# an arbitrary host.
+MOD_DOWNLOAD_HOSTS = (
+    "cdn.modrinth.com", "api.modrinth.com",
+    "mediafilez.forgecdn.net", "edge.forgecdn.net", "media.forgecdn.net",
+)
+
+# Jars this manager downloaded, so a later cleanup never removes one that was
+# put there by hand.
+RESOLVED_INDEX = ".packwiz-resolved.json"
+
+def _resolved_index_path(server_path: str) -> str:
+    return os.path.join(server_path, RESOLVED_INDEX)
+
+def _load_resolved(server_path: str) -> dict:
+    path = _resolved_index_path(server_path)
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+def _save_resolved(server_path: str, data: dict) -> None:
+    with open(_resolved_index_path(server_path), "w") as f:
+        json.dump(data, f, indent=2, sort_keys=True)
+
+def _pw_files(server_path: str) -> list[str]:
+    """Every .pw.toml in the pack, as paths relative to the server root."""
+    out = []
+    for root, dirs, files in os.walk(server_path):
+        # The world directory can hold hundreds of thousands of region files.
+        dirs[:] = [d for d in dirs if not d.startswith(".") and d not in
+                   ("world", "world_nether", "world_the_end", "logs", "cache",
+                    "libraries", "versions", "crash-reports", "backups")]
+        for f in files:
+            if f.endswith(".pw.toml"):
+                out.append(os.path.relpath(os.path.join(root, f), server_path))
+    return sorted(out)
+
+def _parse_pw(server_path: str, rel: str) -> dict | None:
+    """Read one pack file into {name, filename, side, url, hash, hash_format}."""
+    import tomllib
+    try:
+        with open(os.path.join(server_path, rel), "rb") as f:
+            doc = tomllib.load(f)
+    except (OSError, ValueError):
+        return None
+    dl = doc.get("download") or {}
+    filename = doc.get("filename") or ""
+    if not filename or "/" in filename or "\\" in filename:
+        return None
+    return {
+        "meta":        rel,
+        "name":        doc.get("name") or filename,
+        "filename":    filename,
+        "side":        (doc.get("side") or "both").lower(),
+        "url":         dl.get("url") or "",
+        "hash":        (dl.get("hash") or "").lower(),
+        "hash_format": (dl.get("hash-format") or "sha512").lower(),
+        "dir":         os.path.dirname(rel),
+    }
+
+def _pw_state(server_path: str) -> list[dict]:
+    """Every pack entry plus whether its jar is actually on disk."""
+    rows = []
+    for rel in _pw_files(server_path):
+        entry = _parse_pw(server_path, rel)
+        if not entry:
+            continue
+        jar = os.path.join(server_path, entry["dir"], entry["filename"])
+        entry["present"] = os.path.isfile(jar)
+        entry["size"] = os.path.getsize(jar) if entry["present"] else 0
+        # A client-only mod on a server is not missing, it is not wanted.
+        entry["wanted"] = entry["side"] in ("both", "server")
+        rows.append(entry)
+    return rows
+
+def _hash_file(path: str, algo: str) -> str:
+    h = hashlib.new(algo)
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(MOD_DOWNLOAD_CHUNK), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+def _download_mod(entry: dict, dest: str) -> str:
+    """Fetch one jar to `dest`, verifying the hash. Returns '' on success."""
+    url = entry["url"]
+    if not url.startswith("https://"):
+        return "download URL is not https"
+    host = urllib.parse.urlparse(url).hostname or ""
+    if host not in MOD_DOWNLOAD_HOSTS:
+        return f"refusing to download from an unexpected host ({host})"
+
+    algo = entry["hash_format"].replace("-", "")
+    if algo not in hashlib.algorithms_available:
+        return f"unsupported hash format ({entry['hash_format']})"
+
+    tmp = dest + ".part"
+    req = urllib.request.Request(url, headers={"User-Agent": "MCServerClusterManager"})
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp, open(tmp, "wb") as out:
+            total = 0
+            while True:
+                chunk = resp.read(MOD_DOWNLOAD_CHUNK)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > MOD_DOWNLOAD_MAX:
+                    raise ValueError("file exceeds the size limit")
+                out.write(chunk)
+    except Exception as exc:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        return f"download failed: {str(exc)[:160]}"
+
+    if entry["hash"]:
+        got = _hash_file(tmp, algo)
+        if not hmac.compare_digest(got, entry["hash"]):
+            os.remove(tmp)
+            return f"{algo} mismatch — the file does not match what the pack expects"
+
+    # Only now does it become the real filename, so an interrupted download
+    # never leaves a half-written jar the server would try to load.
+    os.replace(tmp, dest)
+    return ""
+
+def _resolve_pack(server_path: str) -> dict:
+    """Download every jar the pack references but does not have."""
+    resolved = _load_resolved(server_path)
+    report = {"downloaded": [], "skipped": [], "failed": [], "present": 0}
+
+    for entry in _pw_state(server_path):
+        if not entry["wanted"]:
+            report["skipped"].append({"name": entry["name"], "why": f"{entry['side']}-side only"})
+            continue
+        if entry["present"]:
+            report["present"] += 1
+            continue
+        target_dir = os.path.join(server_path, entry["dir"])
+        os.makedirs(target_dir, exist_ok=True)
+        dest = os.path.join(target_dir, entry["filename"])
+        err = _download_mod(entry, dest)
+        if err:
+            report["failed"].append({"name": entry["name"], "why": err})
+            continue
+        report["downloaded"].append({"name": entry["name"], "file": entry["filename"]})
+        resolved[entry["meta"]] = os.path.join(entry["dir"], entry["filename"])
+
+    _save_resolved(server_path, resolved)
+    return report
+
+def _forget_resolved(server_path: str, meta_rel: str) -> str | None:
+    """Delete the jar this manager downloaded for a pack entry, if any."""
+    resolved = _load_resolved(server_path)
+    rel = resolved.pop(meta_rel, None)
+    if not rel:
+        return None
+    try:
+        jar = safe_path(server_path, rel)
+        if os.path.isfile(jar):
+            os.remove(jar)
+    except (OSError, HTTPException):
+        rel = None
+    _save_resolved(server_path, resolved)
+    return rel
+
+
 def _packwiz_error(result: subprocess.CompletedProcess) -> str:
     """packwiz reports failures on stdout, so stderr alone is usually empty."""
     for stream in (result.stderr, result.stdout):
@@ -2288,14 +2475,88 @@ async def packwiz_exec(request: Request, name: str = Path(...)):
         _packwiz_init(packwiz, name, server_path)
     else:
         _seed_packwizignore(server_path)
-    res = subprocess.run([packwiz, "modrinth", action, mod_slug, "-y"],
-                         cwd=server_path, capture_output=True, text=True,
+    # A removal takes the .pw.toml with it, so note what the pack knew before
+    # running the command — afterwards there is nothing left to read.
+    before = {e["meta"]: e for e in _pw_state(server_path)} if action == "remove" else {}
+
+    # Removal is a top-level command: `packwiz modrinth` only knows add and
+    # export. Asking it to remove printed the help text and exited 0, so this
+    # used to report success having done nothing at all.
+    argv = [packwiz, "modrinth", "add", mod_slug, "-y"] if action == "add" \
+        else [packwiz, "remove", mod_slug, "-y"]
+    res = subprocess.run(argv, cwd=server_path, capture_output=True, text=True,
                          stdin=subprocess.DEVNULL, check=False)
     if res.returncode != 0:
         raise HTTPException(500, f"Packwiz error: {_packwiz_error(res)}")
     subprocess.run([packwiz, "refresh"], cwd=server_path, capture_output=True, check=False)
     audit("PACKWIZ", name, f"action={action} mod={mod_slug}")
-    return JSONResponse({"message": f"Packwiz {action} completed for '{mod_slug}'."})
+
+    if action == "remove":
+        gone = [m for m in before if not os.path.exists(os.path.join(server_path, m))]
+        if not gone:
+            # packwiz matches on the metadata name, which is not always the
+            # Modrinth slug — say so instead of claiming a success.
+            raise HTTPException(404, f"Nothing in the pack matched '{mod_slug}'. "
+                                     "Check the name in the pack contents list.")
+        removed = [r for r in (_forget_resolved(server_path, m) for m in gone) if r]
+        detail = f" Removed {len(removed)} jar(s)." if removed else \
+                 " Its jar was not one this manager downloaded, so it was left alone."
+        return JSONResponse({"message": f"Removed '{mod_slug}' from the pack.{detail}",
+                             "removed": removed})
+
+    # An add only writes metadata. Without this step the mods folder fills up
+    # with .toml files and the server has nothing to load.
+    report = await asyncio.to_thread(_resolve_pack, server_path)
+    if report["failed"]:
+        first = report["failed"][0]
+        raise HTTPException(502, f"'{mod_slug}' was added to the pack, but downloading "
+                                 f"{first['name']} failed: {first['why']}")
+    got = ", ".join(d["file"] for d in report["downloaded"]) or "nothing new"
+    return JSONResponse({
+        "message": f"Added '{mod_slug}' and downloaded {got}.",
+        "report": report,
+    })
+
+@app.post("/api/server/{name}/packwiz/sync")
+async def packwiz_sync(name: str = Path(...)):
+    """Download every jar the pack references but does not have.
+
+    Exists because a pack built before the add step resolved downloads is all
+    metadata and no jars — this brings it up to date without re-adding.
+    """
+    validate_name(name)
+    server_path = safe_path(DATA_DIR, name)
+    if not os.path.exists(server_path):
+        raise HTTPException(404, "Container volume missing.")
+    report = await asyncio.to_thread(_resolve_pack, server_path)
+    audit("PACKWIZ_SYNC", name,
+          f"downloaded={len(report['downloaded'])} failed={len(report['failed'])}")
+
+    bits = []
+    if report["downloaded"]: bits.append(f"downloaded {len(report['downloaded'])}")
+    if report["present"]:    bits.append(f"{report['present']} already present")
+    if report["skipped"]:    bits.append(f"{len(report['skipped'])} client-side skipped")
+    if report["failed"]:     bits.append(f"{len(report['failed'])} failed")
+    return JSONResponse({
+        "message": "Pack sync: " + (", ".join(bits) if bits else "nothing to do") + ".",
+        "report": report,
+    })
+
+@app.get("/api/server/{name}/packwiz/state")
+async def packwiz_state(name: str = Path(...)):
+    """What the pack lists, and which of it is actually on disk."""
+    validate_name(name)
+    server_path = safe_path(DATA_DIR, name)
+    if not os.path.exists(server_path):
+        raise HTTPException(404, "Container volume missing.")
+    rows = await asyncio.to_thread(_pw_state, server_path)
+    missing = [r for r in rows if r["wanted"] and not r["present"]]
+    return JSONResponse({
+        "entries": rows,
+        "total": len(rows),
+        "missing": len(missing),
+        "has_pack": os.path.isfile(os.path.join(server_path, "pack.toml")),
+    })
 
 @app.get("/api/packwiz/status")
 async def packwiz_status():
