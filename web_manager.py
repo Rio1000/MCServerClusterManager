@@ -3584,8 +3584,24 @@ async def ws_endpoint(websocket: WebSocket):
 
 # ---------------------------------------------------------------------------
 # Static
+#
+# StaticFiles sends ETag and Last-Modified but no Cache-Control, which leaves
+# the browser to guess how long a file stays fresh. It guesses in hours, so a
+# deploy that changes script.js and index.html together can leave a browser
+# running the new markup against the old script — every handler added in that
+# release is suddenly "not defined".
+#
+# `no-cache` does not mean "do not store": it means "revalidate before use".
+# The ETag above is what makes that cheap, so the browser gets a 304 with an
+# empty body unless the file really did change.
 # ---------------------------------------------------------------------------
-app.mount("/", StaticFiles(directory=os.path.dirname(os.path.abspath(__file__)), html=True), name="static")
+class RevalidatingStatics(StaticFiles):
+    async def get_response(self, path: str, scope):
+        response = await super().get_response(path, scope)
+        response.headers.setdefault("Cache-Control", "no-cache")
+        return response
+
+app.mount("/", RevalidatingStatics(directory=os.path.dirname(os.path.abspath(__file__)), html=True), name="static")
 
 if __name__ == "__main__":
     uvicorn.run(app, host=LISTEN_HOST, port=LISTEN_PORT)
