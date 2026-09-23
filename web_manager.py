@@ -700,6 +700,20 @@ AUX_PORTS = {
     19132: "bedrock",     # Geyser / Bedrock
 }
 
+# Servers created before the container port was pinned to the service default
+# have it shifted upward instead — `_next_free_port` walks up from the default,
+# so a container on 19134 is still Geyser. Matching a span rather than one
+# number lets those older servers be reconciled too.
+AUX_PORT_SPAN = 20
+
+def _aux_service_for(container_port: int) -> str | None:
+    if container_port in AUX_PORTS:
+        return AUX_PORTS[container_port]
+    for base, service in AUX_PORTS.items():
+        if base < container_port <= base + AUX_PORT_SPAN:
+            return service
+    return None
+
 
 def _host_listeners() -> set[tuple[int, str]]:
     """(port, proto) already listening on the host, container or otherwise."""
@@ -739,12 +753,55 @@ def _next_free_port(start: int, proto: str, taken: set[tuple[int, str]]) -> int:
     raise HTTPException(409, f"No free {proto} port at or above {start}.")
 
 
-def _seed_aux_config(server_path: str, service: str, port: int) -> None:
-    """Point a side service's own config at the port it will be published on.
+def _sync_aux_configs(name: str) -> list[str]:
+    """Reconcile each side service's config with the ports actually published.
 
-    Written before first boot so the service picks it up on its initial load;
-    both files are plain key=value and are rewritten in place if they already
-    exist (the duplicate flow copies them from the source server).
+    Run on every start rather than only at creation. A brand new server has
+    neither Geyser nor voice chat installed yet, so seeding at create time
+    writes nothing and the mod later generates a stock config of its own —
+    which is how a server ends up publishing one port while the service listens
+    on another. Re-running on start means the manager corrects it the first
+    time the server comes up after the mod is added.
+    """
+    try:
+        server_path = safe_path(DATA_DIR, name)
+    except HTTPException:
+        return []
+    if not os.path.isdir(server_path):
+        return []
+
+    code, out, _ = _run(["docker", "port", name], 15)
+    if code != 0:
+        return []
+
+    notes = []
+    for line in out.splitlines():
+        # "19132/udp -> 0.0.0.0:19134"
+        m = re.match(r'^(\d+)/(tcp|udp)\s*->\s*(?:.*:)(\d+)$', line.strip())
+        if not m:
+            continue
+        container, proto, host = int(m.group(1)), m.group(2), int(m.group(3))
+        service = _aux_service_for(container)
+        if not service:
+            continue
+        if _seed_aux_config(server_path, service, container, host):
+            notes.append(f"{service}: listens on {container}, reachable on {host}")
+    return notes
+
+
+def _seed_aux_config(server_path: str, service: str, port: int,
+                     public_port: int | None = None) -> bool:
+    """Point a side service's own config at its ports. Returns True if written.
+
+    `port` is what the service binds inside the container; `public_port` is
+    what players reach it on from outside. They differ whenever the host side
+    was moved off a collision, and the two services need different handling:
+
+      Bedrock  — the client dials whatever address and port it was given, so
+                 the mapping alone is enough and only the bind port matters.
+      Voice chat — the server *tells* the client which port to use, so the
+                 announcement has to carry the public port or clients will
+                 dial the internal one and fail.
     """
     if service == "voicechat":
         cfg_dir = os.path.join(server_path, "config", "voicechat")
@@ -765,9 +822,9 @@ def _seed_aux_config(server_path: str, service: str, port: int) -> None:
                     cfg = candidate
                     break
         if not cfg:
-            return
+            return False
     else:
-        return
+        return False
 
     if key is None:
         # Geyser nests the port under `bedrock:`; only rewritten when the file
@@ -775,7 +832,7 @@ def _seed_aux_config(server_path: str, service: str, port: int) -> None:
         # plugin's job and a stub would override more than intended.
         with open(cfg) as f:
             lines = f.readlines()
-        in_bedrock = False
+        in_bedrock, changed = False, False
         for i, line in enumerate(lines):
             if re.match(r'^bedrock:\s*$', line):
                 in_bedrock = True
@@ -785,34 +842,59 @@ def _seed_aux_config(server_path: str, service: str, port: int) -> None:
                     break
                 if re.match(r'^\s+port:\s', line):
                     indent = line[:len(line) - len(line.lstrip())]
-                    lines[i] = f"{indent}port: {port}\n"
+                    want = f"{indent}port: {port}\n"
+                    changed = lines[i] != want
+                    lines[i] = want
                     break
-        with open(cfg, "w") as f:
-            f.writelines(lines)
-        return
+        if changed:
+            with open(cfg, "w") as f:
+                f.writelines(lines)
+        return changed
 
-    lines, replaced = [], False
+    # Voice chat: bind to the container port, but announce the one players can
+    # actually reach. Left blank when they match, so the stock config is not
+    # cluttered with a redundant override.
+    wanted = {key: str(port)}
+    if service == "voicechat":
+        wanted["voice_host"] = str(public_port) if public_port and public_port != port else ""
+
+    existing = ""
     if os.path.isfile(cfg):
         with open(cfg) as f:
-            for line in f:
-                if re.match(rf'^\s*{key}\s*=', line):
-                    lines.append(f"{key}={port}\n")
-                    replaced = True
-                else:
-                    lines.append(line)
-    if not replaced:
-        lines.append(f"{key}={port}\n")
+            existing = f.read()
+
+    lines, seen = [], set()
+    for line in existing.splitlines(keepends=True):
+        m = re.match(r'^\s*([a-z_]+)\s*=', line)
+        if m and m.group(1) in wanted:
+            seen.add(m.group(1))
+            lines.append(f"{m.group(1)}={wanted[m.group(1)]}\n")
+        else:
+            lines.append(line)
+    for k, v in wanted.items():
+        if k not in seen:
+            lines.append(f"{k}={v}\n")
+
+    updated = "".join(lines)
+    if updated == existing:
+        return False
     with open(cfg, "w") as f:
-        f.writelines(lines)
+        f.write(updated)
+    return True
 
 
 def _resolve_bindings(bindings: list[dict], taken: set[tuple[int, str]]) -> list[dict]:
     """Shift side-service ports off collisions; leave the Java port strict.
 
     The Minecraft port is what players type, so a silent move there would be
-    surprising and is left to fail loudly. Voice chat and Bedrock are picked up
-    from the server during the handshake, so moving those is invisible to
-    players and is done automatically.
+    surprising and is left to fail loudly.
+
+    Only the *host* side of a side service moves. The container keeps the
+    service's own default, exactly as the Java port does (host 25567 ->
+    container 25565), which means the service's stock config is already
+    correct and nothing has to be rewritten for it to bind. Moving the
+    container port instead — as this used to — only works if the mod happens
+    to be installed at create time, and on a fresh server it never is.
     """
     resolved: set[tuple[int, str]] = set()
     out: list[dict] = []
@@ -821,8 +903,7 @@ def _resolve_bindings(bindings: list[dict], taken: set[tuple[int, str]]) -> list
         service = AUX_PORTS.get(b["container"]) if b.get("aux") else None
         if service and (key in taken or key in resolved):
             free = _next_free_port(b["container"] + 1, b["proto"], taken | resolved)
-            b = {**b, "host": free, "container": free, "moved_from": b["host"],
-                 "service": service}
+            b = {**b, "host": free, "moved_from": b["host"], "service": service}
         elif service:
             b = {**b, "service": service}
         out.append(b)
@@ -1599,7 +1680,7 @@ async def create_server(request: Request):
 
     for b in bindings:
         if b.get("service"):
-            _seed_aux_config(server_path, b["service"], b["host"])
+            _seed_aux_config(server_path, b["service"], b["container"], b["host"])
 
     cmd = ["docker", "run", "-d", "-it", "--name", name]
     for b in bindings:
@@ -1784,7 +1865,7 @@ async def duplicate_server(request: Request, name: str = Path(...)):
 
     for b in bindings:
         if b.get("service"):
-            _seed_aux_config(dst_path, b["service"], b["host"])
+            _seed_aux_config(dst_path, b["service"], b["container"], b["host"])
 
     cmd = ["docker", "run", "-d", "-it", "--name", new_name]
     for b in bindings:
@@ -2035,6 +2116,14 @@ async def server_action(request: Request, name: str = Path(...)):
     # crash to the watchdog on its next tick.
     if action in ("stop", "restart", "kill", "delete"):
         _mark_intentional(name)
+
+    # Side services generate their own config the first time they run, which is
+    # after the server was created — so the ports get reconciled on the way up,
+    # not once at creation when the mods were not there yet.
+    aux_notes: list[str] = []
+    if action in ("start", "restart"):
+        aux_notes = await asyncio.to_thread(_sync_aux_configs, name)
+
     cmd = ["docker", "rm", "-f", name] if action == "delete" else ["docker", action, name]
     code, _, err = _run(cmd)
     if code != 0:
@@ -2046,7 +2135,11 @@ async def server_action(request: Request, name: str = Path(...)):
         _restart_history.pop(name, None)
         _intentional_stops.discard(name)
     audit("ACTION", name, f"action={action}")
-    return JSONResponse({"message": f"Container '{name}' → {action}."})
+    if aux_notes:
+        audit("AUX_SYNC", name, "; ".join(aux_notes))
+    suffix = f" Corrected side-service ports — {'; '.join(aux_notes)}." if aux_notes else ""
+    return JSONResponse({"message": f"Container '{name}' → {action}.{suffix}",
+                         "aux_synced": aux_notes})
 
 # ---------------------------------------------------------------------------
 # REST — Container resource limits
