@@ -3310,7 +3310,7 @@ async def server_debug(name: str = Path(...)):
     logs   = _recent_files(os.path.join(root, "logs"))
     key_files = []
     for rel in ("server.properties", "eula.txt", "ops.json", "whitelist.json",
-                "pack.toml", "logs/latest.log", f"{level}/level.dat", "server.jar"):
+                "pack.toml", "logs/latest.log", f"{level}/level.dat"):
         fp = os.path.join(root, rel)
         exists = os.path.exists(fp)
         entry = {"path": rel, "exists": exists}
@@ -3321,6 +3321,7 @@ async def server_debug(name: str = Path(...)):
             except OSError:
                 pass
         key_files.append(entry)
+    key_files.append(_launcher_entry(root))
 
     try:
         du = shutil.disk_usage(DATA_DIR if os.path.isdir(DATA_DIR) else "/")
@@ -3378,9 +3379,76 @@ async def server_debug(name: str = Path(...)):
                                     disk.get("free_bytes", 0)),
     })
 
+# Only vanilla actually boots a file called server.jar. Fabric, Paper, Forge
+# and friends each ship their own launcher name, so looking for one fixed
+# filename reported "missing" on a server that was running perfectly well.
+_LAUNCHER_RE = re.compile(
+    r'^(?:server|fabric-server|forge|neoforge|quilt-server|paper|purpur|folia|'
+    r'spigot|craftbukkit|velocity|waterfall|bungeecord|minecraft_server)'
+    r'[\w.+-]*\.jar$', re.I)
+
+def _launcher_entry(root: str) -> dict:
+    """The server jar this instance would actually start, whatever it is named."""
+    candidates = []
+    try:
+        for f in os.listdir(root):
+            if not f.lower().endswith(".jar") or not _LAUNCHER_RE.match(f):
+                continue
+            try:
+                st = os.stat(os.path.join(root, f))
+            except OSError:
+                continue
+            candidates.append((st.st_size, f, st))
+    except OSError:
+        pass
+    if not candidates:
+        return {"path": "server jar", "exists": False,
+                "note": "no launcher jar in the volume root"}
+    # Largest wins: the boot jar dwarfs anything incidental sitting beside it.
+    size, fname, st = max(candidates, key=lambda c: c[0])
+    return {"path": fname, "exists": True, "size": size,
+            "human": _human(size), "mtime": int(st.st_mtime),
+            "note": "launcher jar"}
+
+# Collapsing repeats needs a notion of "the same line again" that ignores the
+# parts guaranteed to differ: the timestamp, the thread, and any number or
+# path embedded in the message. One mod warning about 300 files produces 300
+# lines that are identical apart from the filename.
+_LOG_STAMP_RE = re.compile(r'^\[[^\]]*\]\s*(\[[^\]]*\]:?)?\s*')
+_LOG_VARY_RE  = re.compile(
+    r'\b[\w./-]+\.(?:png|json|jar|toml|mcmeta|ogg|nbt)\b'   # asset paths
+    r'|\b[a-z0-9_]+:[a-z0-9_/.]+\b'                          # minecraft:stone, create:track
+    r'|\b\d+\b')                                             # counts, sizes, coordinates
+
+def _log_signature(line: str) -> str:
+    """What makes two log lines 'the same message'."""
+    return _LOG_VARY_RE.sub("·", _LOG_STAMP_RE.sub("", line)).strip().lower()[:200]
+
+def _collapse_repeats(lines: list[str]) -> list[dict]:
+    """Group consecutive same-shaped lines into one row with a count.
+
+    Only consecutive runs are merged: a warning that recurs after other output
+    is worth seeing again, whereas 300 in a row is one event.
+    """
+    out: list[dict] = []
+    for line in lines:
+        sig = _log_signature(line)
+        if out and out[-1]["sig"] == sig:
+            out[-1]["count"] += 1
+            continue
+        out.append({"text": line, "sig": sig, "count": 1})
+    for row in out:
+        row.pop("sig", None)
+    return out
+
 @app.get("/api/server/{name}/debug/logs")
-async def debug_logs(name: str = Path(...), lines: int = 400, problems: bool = False):
-    """Log tail for the debug screen — optionally only the lines that matter."""
+async def debug_logs(name: str = Path(...), lines: int = 400,
+                     problems: bool = False, collapse: bool = True):
+    """Log tail for the debug screen — optionally only the lines that matter.
+
+    Repeats are collapsed by default: a single mod can emit hundreds of
+    near-identical warnings, which otherwise push everything else out of view.
+    """
     validate_name(name)
     lines = max(1, min(int(lines), 5000))
     code, out, err = await asyncio.to_thread(
@@ -3390,11 +3458,19 @@ async def debug_logs(name: str = Path(...), lines: int = 400, problems: bool = F
     text = "\n".join(p for p in (out, err) if p)
     all_lines = text.splitlines()
     hits = [l for l in all_lines if _LOG_PROBLEM_RE.search(l)]
+    selected = hits[-lines:] if problems else all_lines
+
+    rows = _collapse_repeats(selected) if collapse else [
+        {"text": l, "count": 1} for l in selected]
     return JSONResponse({
-        "lines":    hits[-lines:] if problems else all_lines,
+        # Plain strings kept for anything still reading the old shape.
+        "lines":    [r["text"] for r in rows],
+        "rows":     rows,
         "total":    len(all_lines),
+        "shown":    len(selected),
         "problems": len(hits),
         "filtered": problems,
+        "collapsed": len(selected) - len(rows),
     })
 
 @app.get("/api/server/{name}/debug/disk")

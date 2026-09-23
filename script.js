@@ -3391,7 +3391,10 @@ async function loadDebug() {
   document.getElementById('dbg-files').innerHTML = (data.files || []).map(f => `
     <div class="list-row">
       <div class="row-main mono">${escapeHtml(f.path)}</div>
-      <div class="row-sub">${f.exists ? `${escapeHtml(f.human || '')} · ${escapeHtml(fmtTime(f.mtime))}` : 'missing'}</div>
+      <div class="row-sub">${f.exists
+        ? `${escapeHtml(f.human || '')} · ${escapeHtml(fmtTime(f.mtime))}`
+          + (f.note ? ` · ${escapeHtml(f.note)}` : '')
+        : escapeHtml(f.note || 'missing')}</div>
       <span class="dbg-pill ${f.exists ? 'ok' : 'off'}">${f.exists ? 'PRESENT' : 'ABSENT'}</span>
     </div>`).join('') || '<div class="empty">Volume not readable.</div>';
 
@@ -3458,12 +3461,24 @@ async function loadDebugLogs() {
     `&problems=${debugProblemsOnly}`);
   if (!data) { box.textContent = 'Log stream unavailable (does the container exist?).'; return; }
   debugLogs = data;
-  box.textContent = (data.lines || []).join('\n') ||
-    (debugProblemsOnly ? 'No errors or warnings in this window.' : 'No output.');
+
+  const rows = data.rows || (data.lines || []).map(t => ({ text: t, count: 1 }));
+  if (!rows.length) {
+    box.textContent = debugProblemsOnly ? 'No errors or warnings in this window.' : 'No output.';
+  } else {
+    // A run of identical lines becomes one row with a multiplier, so a mod
+    // that warns about 300 files cannot push everything else off the screen.
+    box.innerHTML = rows.map(r =>
+      `<div class="dbg-log-line">${escapeHtml(r.text)}` +
+      (r.count > 1 ? `<span class="dbg-repeat">×${r.count}</span>` : '') +
+      `</div>`).join('');
+  }
   box.scrollTop = box.scrollHeight;
-  document.getElementById('dbg-log-meta').textContent =
-    `${data.total} line(s) scanned · ${data.problems} flagged` +
-    (data.filtered ? ' · showing flagged only' : '');
+
+  const bits = [`${data.total} line(s) scanned`, `${data.problems} flagged`];
+  if (data.filtered) bits.push('showing flagged only');
+  if (data.collapsed) bits.push(`${data.collapsed} repeat(s) collapsed`);
+  document.getElementById('dbg-log-meta').textContent = bits.join(' · ');
 }
 
 function toggleDebugProblems() {
@@ -3545,8 +3560,12 @@ function copyDebugReport() {
   }
   section('Processes'); L.push(d.top || '  (container not running)');
   if (debugLogs) {
-    section(`Log tail${debugLogs.filtered ? ' (flagged lines only)' : ''}`);
-    (debugLogs.lines || []).forEach(l => L.push(`  ${l}`));
+    section(`Log tail${debugLogs.filtered ? ' (flagged lines only)' : ''}`
+      + (debugLogs.collapsed ? ` — ${debugLogs.collapsed} repeat(s) collapsed` : ''));
+    // Carry the multiplier into the pasted report too, otherwise it is back to
+    // hundreds of identical lines for whoever is reading it.
+    const rows = debugLogs.rows || (debugLogs.lines || []).map(t => ({ text: t, count: 1 }));
+    rows.forEach(r => L.push(`  ${r.text}${r.count > 1 ? `   [x${r.count}]` : ''}`));
   }
 
   const text = L.join('\n');

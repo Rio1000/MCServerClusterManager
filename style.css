@@ -1902,6 +1902,24 @@ body.no-target .needs-target {
   font-size: 11px;
 }
 
+/* A run of identical lines collapses to one row carrying a multiplier. The
+   badge sits inline so the line it belongs to stays obvious. */
+.dbg-log-line {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.dbg-repeat {
+  display: inline-block;
+  margin-left: var(--s2);
+  padding: 0 5px;
+  background: #644f00;
+  color: #ffe98a;
+  border: 1px solid #ffd84d;
+  font-size: 11px;
+  vertical-align: baseline;
+}
+
 .dbg-usage {
   margin-bottom: var(--s2);
 }
