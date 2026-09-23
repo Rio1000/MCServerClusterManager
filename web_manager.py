@@ -2055,29 +2055,123 @@ async def server_action(request: Request, name: str = Path(...)):
 async def update_resources(request: Request, name: str = Path(...)):
     validate_name(name)
     data   = await request.json()
-    memory = data.get("memory", "").strip()
-    cpus   = data.get("cpus", "").strip()
+    memory = str(data.get("memory", "")).strip()
+    cpus   = str(data.get("cpus", "")).strip()
 
     if memory and not re.match(r'^\d+[MmGg]$', memory):
         raise HTTPException(400, "Invalid memory (e.g. 2G, 512M).")
     if cpus:
         try:
-            v = float(cpus)
-            if v <= 0: raise ValueError()
+            # 0 is how docker spells "no limit", which is the only way back to
+            # an uncapped container once one has been set.
+            if float(cpus) < 0:
+                raise ValueError()
         except ValueError:
-            raise HTTPException(400, "Invalid CPU value (e.g. 1.5).")
+            raise HTTPException(400, "Invalid CPU value (e.g. 1.5, or 0 for no limit).")
 
     update_args: list[str] = []
-    if memory: update_args += ["--memory", memory.upper()]
-    if cpus:   update_args += ["--cpus",   cpus]
+    if memory:
+        # --memory alone is rejected on a container whose memoryswap is still
+        # unset ("Memory limit should be smaller than already set memoryswap
+        # limit"), so the pair has to move together. 2x mirrors what Docker
+        # itself picks at create time, which is what containers deployed
+        # through this manager already have.
+        size = int(memory[:-1])
+        unit = memory[-1].upper()
+        update_args += ["--memory", f"{size}{unit}", "--memory-swap", f"{size * 2}{unit}"]
+    if cpus:
+        # `--cpus 0` is accepted and silently does nothing. Writing the quota
+        # directly is what actually releases the cap, and it survives a
+        # restart — though HostConfig.NanoCpus stays stale afterwards, which
+        # is why _effective_limits reads the cgroup instead of inspect.
+        update_args += ["--cpu-quota", "-1"] if float(cpus) == 0 else ["--cpus", cpus]
     if not update_args:
         raise HTTPException(400, "Provide at least one resource limit.")
 
+    # docker update rewrites the cgroup live — no restart, no dropped players.
     code, _, err = _run(["docker", "update"] + update_args + [name])
     if code != 0:
         raise HTTPException(500, f"docker update failed: {err}")
     audit("RESOURCES", name, f"memory={memory} cpus={cpus}")
-    return JSONResponse({"message": f"Resource limits updated for '{name}'."})
+
+    applied = []
+    if cpus:   applied.append(f"{'no CPU limit' if float(cpus) == 0 else cpus + ' CPUs'}")
+    if memory: applied.append(f"{memory.upper()} memory")
+    return JSONResponse({
+        "message": f"Applied to '{name}' — {', '.join(applied)}. Takes effect immediately.",
+    })
+
+def _effective_limits(name: str) -> tuple[float, int, bool]:
+    """What the kernel is actually enforcing: (cpus, memory_bytes, live).
+
+    Read from the container's own cgroup rather than `docker inspect`, because
+    releasing a CPU limit leaves HostConfig.NanoCpus permanently stale — it
+    keeps reporting the old cap on a container that is no longer capped, even
+    across restarts. The container sees its own namespaced cgroup at
+    /sys/fs/cgroup, so no host-side path guessing is needed.
+    """
+    code, out, _ = _run(["docker", "exec", name, "sh", "-c",
+                         "cat /sys/fs/cgroup/cpu.max /sys/fs/cgroup/memory.max"], 15)
+    if code != 0:
+        return -1.0, -1, False          # not running; caller falls back
+
+    lines = [l.strip() for l in out.splitlines() if l.strip()]
+    cpus, mem = 0.0, 0
+    if lines:
+        quota, _, period = lines[0].partition(" ")
+        if quota != "max":
+            try:
+                cpus = int(quota) / int(period or 100000)
+            except (TypeError, ValueError, ZeroDivisionError):
+                cpus = 0.0
+    if len(lines) > 1 and lines[1] != "max":
+        try:
+            mem = int(lines[1])
+        except ValueError:
+            mem = 0
+    return cpus, mem, True
+
+@app.get("/api/server/{name}/resources")
+async def get_resources(name: str = Path(...)):
+    """Current container limits, alongside what the host actually has."""
+    validate_name(name)
+    code, out, _ = await asyncio.to_thread(_run, [
+        "docker", "inspect", "-f",
+        "{{.HostConfig.NanoCpus}}|{{.HostConfig.Memory}}|{{.HostConfig.CpuQuota}}"
+        "|{{.HostConfig.CpuPeriod}}|{{range .Config.Env}}{{println .}}{{end}}",
+        name], 20)
+    if code != 0:
+        raise HTTPException(404, f"'{name}' not found.")
+
+    head = out.splitlines()[0] if out else ""
+    parts = (head.split("|") + ["", "", "", ""])[:4]
+    nano  = int(parts[0] or 0)
+    mem   = int(parts[1] or 0)
+    quota, period = int(parts[2] or 0), int(parts[3] or 0)
+    # --cpus sets NanoCpus; an older --cpu-quota/--cpu-period pair means the
+    # same thing and would otherwise read as unlimited.
+    cpus = nano / 1e9 if nano else (quota / period if quota > 0 and period > 0 else 0)
+
+    live_cpus, live_mem, live = await asyncio.to_thread(_effective_limits, name)
+    if live:
+        cpus, mem = live_cpus, live_mem
+
+    heap = ""
+    for line in out.splitlines():
+        if line.startswith("MEMORY="):
+            heap = line.split("=", 1)[1].strip()
+
+    return JSONResponse({
+        "cpus":          round(cpus, 2),          # 0 == no limit
+        "memory_bytes":  mem,                     # 0 == no limit
+        "memory_human":  _human(mem) if mem else "",
+        "jvm_heap":      heap,
+        "host_cpus":     psutil.cpu_count() or 0,
+        "host_memory":   _human(psutil.virtual_memory().total),
+        # False means the container is stopped and these are the configured
+        # values rather than anything currently being enforced.
+        "live":          live,
+    })
 
 @app.get("/api/server/{name}/stats")
 async def container_stats(name: str = Path(...)):

@@ -261,6 +261,40 @@
 
           <div class="inv-panel">
             <div class="inv-title">
+              <span>Resource Limits</span>
+              <div class="title-actions">
+                <span id="res-host" class="muted-count"></span>
+                <button class="mc-btn sm" onclick="loadResources()">REFRESH</button>
+              </div>
+            </div>
+            <p class="card-hint">Applied to the running container immediately — no restart, no
+              dropped players. A limit is a ceiling, not a reservation, so servers can overlap;
+              an idle one does not hold its share. Minecraft's tick loop is single-threaded, so
+              extra cores help worldgen, networking and GC rather than raw TPS.
+              <strong>A memory limit can be changed later but not removed</strong> — Docker has
+              no way back to uncapped short of recreating the container. CPU limits are freely
+              reversible; 0 clears them.</p>
+            <div class="grid-auto">
+              <div class="field">
+                <label class="field-lbl" for="res-cpus">CPU limit (0 = no limit)</label>
+                <input type="number" id="res-cpus" class="mc-input" min="0" step="0.5"
+                  placeholder="0">
+              </div>
+              <div class="field">
+                <label class="field-lbl" for="res-memory">Memory limit</label>
+                <input type="text" id="res-memory" class="mc-input" placeholder="e.g. 12G"
+                  maxlength="12">
+              </div>
+            </div>
+            <div id="res-current" class="status-line">Reading current limits…</div>
+            <div class="save-bar">
+              <button class="mc-btn green" onclick="saveResources()">APPLY LIMITS</button>
+              <span id="res-hint" class="save-hint"></span>
+            </div>
+          </div>
+
+          <div class="inv-panel">
+            <div class="inv-title">
               <span>History</span>
               <div class="title-actions">
                 <select class="mc-select sm" id="hist-range" onchange="loadServerMetrics()"

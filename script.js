@@ -824,7 +824,7 @@ function sw(id, el) {
   if (id === 'players') { requestPlayerList(); loadAccessList(); }
   if (id === 'files') { fmReload(); }
   if (id === 'cluster') { loadClusterMetrics(); }
-  if (id === 'overview') { loadServerMetrics(); }
+  if (id === 'overview') { loadServerMetrics(); loadResources(); }
   if (id === 'properties') { loadPropHistory(); }
   // The debug snapshot shells out to docker several times, so it is fetched
   // once per target and then only on request.
@@ -941,6 +941,7 @@ function setServerTarget(name, status) {
   debugResetForServer();
   accessResetForServer();
   propHistoryResetForServer();
+  overviewResetForServer();
 
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({ method: 'docker:logs/subscribe', target: name }));
@@ -1665,6 +1666,118 @@ function sparkBlock(title, samples, key, opts) {
       </div>
       ${renderChart(samples, key, opts)}
     </div>`;
+}
+
+// ---------------------------------------------------------------------------
+// Resource limits
+//
+// docker update rewrites the cgroup on a live container, so these apply with
+// no restart. A blank field is left alone rather than treated as zero — you
+// should not have to restate the memory limit to change the CPU one.
+// ---------------------------------------------------------------------------
+// Tracks whether this server already has a memory limit, so the one-way-door
+// warning only fires the first time one is set.
+let resourcesHadMemoryLimit = false;
+
+// Bytes -> the form the input accepts ("12G", "512M"). Whole gigabytes win
+// because that is how these limits are set in practice; anything that does not
+// divide evenly falls back to megabytes rather than rounding the value away.
+function bytesToSizeInput(bytes) {
+  if (!bytes) return '';
+  const GiB = 1024 ** 3, MiB = 1024 ** 2;
+  if (bytes % GiB === 0) return `${bytes / GiB}G`;
+  return `${Math.round(bytes / MiB)}M`;
+}
+
+// Switching target while the panel is already open has to re-fetch, or the
+// card keeps showing the previous server's limits — which is worse than
+// showing nothing, because it looks authoritative.
+function overviewResetForServer() {
+  const panel = document.getElementById('panel-overview');
+  if (!panel || !panel.classList.contains('active')) return;
+  const box = document.getElementById('res-current');
+  if (box) box.textContent = 'Reading current limits…';
+  loadResources();
+  loadServerMetrics();
+}
+
+async function loadResources() {
+  if (!activeServer) return;
+  const box = document.getElementById('res-current');
+  if (!box) return;
+
+  const res = await fetch(`/api/server/${activeServer}/resources`).catch(() => null);
+  if (!res || !res.ok) {
+    box.innerHTML = '<span class="err">Could not read the container limits.</span>';
+    return;
+  }
+  const d = await res.json().catch(() => ({}));
+  resourcesHadMemoryLimit = !!d.memory_bytes;
+
+  const host = document.getElementById('res-host');
+  if (host) host.textContent = `host: ${d.host_cpus} CPUs · ${d.host_memory}`;
+
+  document.getElementById('res-cpus').value = d.cpus || 0;
+  // The field has to hold what the field accepts ("12G"), not what the label
+  // reads ("12.0 GB") — otherwise pressing Apply without editing is rejected.
+  document.getElementById('res-memory').value = bytesToSizeInput(d.memory_bytes);
+
+  const cpuTxt = d.cpus ? `${d.cpus} of ${d.host_cpus} CPUs` : `no CPU limit (all ${d.host_cpus})`;
+  const memTxt = d.memory_bytes ? d.memory_human : 'no memory limit';
+  // The JVM heap is the number that actually decides when the server dies, so
+  // it belongs next to the container ceiling rather than buried in the env.
+  const heapTxt = d.jvm_heap ? ` · JVM heap ${escapeHtml(d.jvm_heap)}` : '';
+  box.innerHTML = `Currently: <b>${escapeHtml(cpuTxt)}</b> · <b>${escapeHtml(memTxt)}</b>${heapTxt}`;
+
+  // A heap at or above the container ceiling is a kill waiting to happen.
+  if (d.memory_bytes && d.jvm_heap) {
+    const m = /^(\d+)([MmGg])$/.exec(d.jvm_heap);
+    if (m) {
+      const heapBytes = Number(m[1]) * (m[2].toLowerCase() === 'g' ? 1024 ** 3 : 1024 ** 2);
+      if (heapBytes >= d.memory_bytes * 0.95) {
+        box.innerHTML += `<br><span class="err">The JVM heap is at or above the container
+          limit — the JVM needs headroom beyond the heap, so this risks an OOM kill.</span>`;
+      }
+    }
+  }
+}
+
+async function saveResources() {
+  if (!activeServer) { toast('Select a server first.', 'error'); return; }
+  const cpus = document.getElementById('res-cpus').value.trim();
+  const memory = document.getElementById('res-memory').value.trim();
+  const hint = document.getElementById('res-hint');
+
+  if (!cpus && !memory) { toast('Set a CPU or memory limit first.', 'error'); return; }
+  if (memory && !/^\d+[MmGg]$/.test(memory)) {
+    toast('Memory must look like 12G or 512M.', 'error');
+    return;
+  }
+
+  // docker update can change a memory limit but not remove one — going back to
+  // uncapped means recreating the container. Worth a confirmation the first
+  // time, since nothing in the UI can undo it afterwards.
+  if (memory && !resourcesHadMemoryLimit
+      && !confirm(`Set a ${memory} memory limit on ${activeServer}?\n\n`
+        + 'Docker can change a memory limit later but cannot remove one — going back to '
+        + 'uncapped requires recreating the container. CPU limits are freely reversible.')) {
+    return;
+  }
+
+  const data = await apiCall(`/api/server/${activeServer}/resources`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ cpus, memory }),
+  });
+  if (!data) { if (hint) { hint.textContent = 'Not applied.'; hint.className = 'save-hint dirty'; } return; }
+
+  logTerm(data.message);
+  toast(data.message, 'ok');
+  if (hint) {
+    hint.textContent = '[APPLIED]';
+    hint.className = 'save-hint saved';
+    setTimeout(() => { hint.textContent = ''; hint.className = 'save-hint'; }, 3000);
+  }
+  loadResources();
 }
 
 // ---------------------------------------------------------------------------
