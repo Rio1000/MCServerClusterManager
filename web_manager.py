@@ -223,7 +223,11 @@ def _record_login_failure(ip: str) -> None:
 # auth endpoints themselves. Everything else requires a session. The middleware
 # and the endpoints are registered further down, once `app` exists.
 PUBLIC_PATHS = {
-    "/login.html", "/style.css", "/favicon.ico",
+    # The login screen and what it needs to render. The favicons are here so
+    # the tab icon shows on the sign-in page too — redirecting an icon request
+    # to /login.html would just hand the browser HTML it cannot draw.
+    "/login.html", "/style.css",
+    "/favicon.ico", "/favicon.svg", "/favicon.png",
     "/api/auth/status", "/api/auth/login", "/api/auth/setup",
 }
 
