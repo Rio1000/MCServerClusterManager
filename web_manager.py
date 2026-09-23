@@ -2224,6 +2224,14 @@ def _effective_limits(name: str) -> tuple[float, int, bool]:
             mem = 0
     return cpus, mem, True
 
+def _cpu_limit_label(name: str, hcfg: dict) -> str:
+    """'6', '0.5' or 'unlimited', from what is actually enforced."""
+    cpus, _, live = _effective_limits(name)
+    if not live:
+        nano = hcfg.get("NanoCpus") or 0
+        return f"{nano / 1e9:g}" if nano else "unlimited"
+    return f"{cpus:g}" if cpus else "unlimited"
+
 @app.get("/api/server/{name}/resources")
 async def get_resources(name: str = Path(...)):
     """Current container limits, alongside what the host actually has."""
@@ -3452,7 +3460,11 @@ async def server_debug(name: str = Path(...)):
         "finished_at":   state.get("FinishedAt", ""),
         "restart_policy": (hcfg.get("RestartPolicy") or {}).get("Name", ""),
         "memory_limit":  _human(hcfg["Memory"]) if hcfg.get("Memory") else "unlimited",
-        "cpu_limit":     (f"{hcfg['NanoCpus'] / 1e9:g}" if hcfg.get("NanoCpus") else "unlimited"),
+        # From the cgroup, not HostConfig: releasing a CPU limit leaves
+        # NanoCpus permanently reporting the old cap on a container the kernel
+        # is no longer capping, which had this panel claiming a limit that was
+        # not being enforced.
+        "cpu_limit":     _cpu_limit_label(name, hcfg),
         "compose_service": (cfg.get("Labels") or {}).get("com.docker.compose.service", ""),
         "health": {
             "status":         health.get("Status", ""),
@@ -3615,19 +3627,37 @@ def _log_signature(line: str) -> str:
     """What makes two log lines 'the same message'."""
     return _LOG_VARY_RE.sub("·", _LOG_STAMP_RE.sub("", line)).strip().lower()[:200]
 
-def _collapse_repeats(lines: list[str]) -> list[dict]:
-    """Group consecutive same-shaped lines into one row with a count.
+# How far back a line may merge into an earlier row. Consecutive-only merging
+# misses the commonest shape of mod spam, where two warnings alternate:
+#   Missing block model for create:x / Could not find material for block/air
+#   Missing block model for create:x / Could not find material for block/air
+# Neither line ever directly follows itself, so nothing collapses. A short
+# lookback folds cycles up to this length.
+#
+# The window counts *rows*, not lines, so it reaches further back in time than
+# the number suggests — a long run of some third message occupies one row, and
+# a repeat on the far side of it still merges. That favours a short summary
+# over a faithful transcript, which is the right trade for a triage view;
+# the full log is a click away in the file manager.
+LOG_MERGE_WINDOW = 4
 
-    Only consecutive runs are merged: a warning that recurs after other output
-    is worth seeing again, whereas 300 in a row is one event.
+def _collapse_repeats(lines: list[str]) -> list[dict]:
+    """Group same-shaped lines into one row with a count.
+
+    A line merges into any of the last few rows, not just the previous one, so
+    an alternating pair collapses to two rows rather than hundreds. Rows keep
+    the position of their first occurrence, which preserves the order events
+    actually happened in.
     """
     out: list[dict] = []
     for line in lines:
         sig = _log_signature(line)
-        if out and out[-1]["sig"] == sig:
-            out[-1]["count"] += 1
-            continue
-        out.append({"text": line, "sig": sig, "count": 1})
+        for row in reversed(out[-LOG_MERGE_WINDOW:]):
+            if row["sig"] == sig:
+                row["count"] += 1
+                break
+        else:
+            out.append({"text": line, "sig": sig, "count": 1})
     for row in out:
         row.pop("sig", None)
     return out
