@@ -488,18 +488,27 @@ def _run(cmd: list[str], timeout: float | None = None) -> tuple[int, str, str]:
     return r.returncode, r.stdout.strip(), r.stderr.strip()
 
 def _get_containers() -> list[dict]:
+    # `ancestor=` matches one exact image reference, so a container started
+    # from a differently-tagged build of the same image (e.g. the java17
+    # variant an older Minecraft version needs) was invisible here even
+    # though it's still one of ours. Filter on the repository name instead
+    # and let the tag vary.
     code, out, _ = _run([
         "docker", "ps", "-a",
-        "--filter", f"ancestor={DOCKER_IMAGE}",
-        "--format", "{{.Names}}|{{.Status}}|{{.Ports}}"
+        "--format", "{{.Names}}|{{.Status}}|{{.Ports}}|{{.Image}}"
     ])
     if code != 0:
         return []
+    image_repo = DOCKER_IMAGE.split(":", 1)[0]
     servers = []
     for line in out.splitlines():
         parts = line.split("|")
-        if len(parts) >= 2:
-            servers.append({"name": parts[0], "status": parts[1], "ports": parts[2] if len(parts) > 2 else ""})
+        if len(parts) < 4:
+            continue
+        name, status, ports, image = parts[0], parts[1], parts[2], parts[3]
+        if image.split(":", 1)[0] != image_repo:
+            continue
+        servers.append({"name": name, "status": status, "ports": ports})
     return servers
 
 # ---------------------------------------------------------------------------
