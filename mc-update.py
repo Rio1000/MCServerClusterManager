@@ -1413,7 +1413,8 @@ def swap_datapacks(server: str, mc: str, record: dict) -> list[dict]:
 
     staged_dir = os.path.join(sdir, DP_STAGED, mc)
     for r in plan:
-        if r["kind"] == "staged":
+        # status, not kind: a staged copy that is already in place is "current".
+        if r["kind"] == "staged" and r["status"] == "staged":
             with open(os.path.join(staged_dir, r["file"]), "rb") as f:
                 data = f.read()
             if not _valid_pack_zip(data):
