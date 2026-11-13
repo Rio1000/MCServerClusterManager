@@ -13,6 +13,7 @@ import socket
 import stat
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -41,7 +42,16 @@ DATA_DIR      = os.environ.get("MCSCM_DATA_DIR") or os.path.dirname(
 DOCKER_IMAGE  = os.environ.get("MCSCM_DOCKER_IMAGE", "itzg/minecraft-server")
 LISTEN_HOST   = os.environ.get("MCSCM_HOST", "0.0.0.0")
 LISTEN_PORT   = int(os.environ.get("MCSCM_PORT", "8080"))
-BACKUP_DIR    = os.path.join(DATA_DIR, "_backups")
+# Archives land in <BACKUP_ROOT>/<server>/Backups, one folder per server, on a
+# different physical disk from the worlds. A single hard-coded directory used
+# to receive every server's archives, so a backup of any other server was filed
+# under CrossplayServer. MCSCM_BACKUP_DIR is still honoured for a deployment
+# that wants one flat directory.
+BACKUP_ROOT     = os.environ.get("MCSCM_BACKUP_ROOT", "/mnt/media/MCSERVERS")
+BACKUP_FLAT_DIR = os.environ.get("MCSCM_BACKUP_DIR", "")
+# Optional {"server-name": "FolderName"} for a server whose backup folder is
+# not named after it (minecraft-crossplay -> CrossplayServer).
+BACKUP_ALIASES_FILE = os.path.join(DATA_DIR, "_backup_dirs.json")
 JOBS_FILE     = os.path.join(DATA_DIR, "_jobs.json")
 TEMPLATES_FILE = os.path.join(DATA_DIR, "_templates.json")
 AUDIT_LOG     = os.path.join(DATA_DIR, "_audit.log")
@@ -354,7 +364,12 @@ psutil.cpu_percent(interval=None)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     os.makedirs(DATA_DIR,   exist_ok=True)
-    os.makedirs(BACKUP_DIR, exist_ok=True)
+    # Deliberately NOT created here: if the backup disk is not mounted, making
+    # the directory would quietly put archives on the root disk instead.
+    _root = BACKUP_FLAT_DIR or BACKUP_ROOT
+    if not os.path.isdir(_root):
+        print(f"[backup] WARNING: {_root} does not exist — backups will fail until "
+              "the backup disk is mounted.")
     os.makedirs(PROP_HISTORY_DIR, exist_ok=True)
     _provision_from_env()
     if not _is_configured():
@@ -1029,6 +1044,8 @@ _PACKWIZ_IGNORE = """\
 /mc_venv/
 /__pycache__/
 /backups/
+# BlueMap's rendered map: tens of thousands of tiles that are not pack content.
+/bluemap/
 # Underscore-prefixed top-level directories are this manager's own state
 # (_backups, _bin) and the convention used for kept-aside previous installs.
 # None of it is pack content, and one such directory held 357 stale files.
@@ -1473,14 +1490,17 @@ def _save_templates(templates: list[dict]) -> None:
 async def _execute_job(action: str, target: str) -> None:
     audit("CRON", target, f"action={action}")
     if action == "backup":
-        server_path = safe_path(DATA_DIR, target)
-        if os.path.exists(server_path):
-            ts  = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            out = os.path.join(BACKUP_DIR, f"{target}_{ts}.tar.gz")
-            await asyncio.to_thread(subprocess.run, ["tar", "-czf", out, "-C", DATA_DIR, target], check=False)
-            pruned = await asyncio.to_thread(_prune_backups, target)
-            await notify("backup", f"💾 Scheduled snapshot of `{target}` complete"
-                                   + (f" ({len(pruned)} old archive(s) pruned)." if pruned else "."))
+        # This used to run tar with check=False and announce "complete" whatever
+        # happened — a full disk or an unmounted drive looked like a success.
+        try:
+            res = await _backup_server(target)
+        except BackupError as exc:
+            # "" bypasses the per-event toggles: a failed backup is always news.
+            await notify("", f"⚠️ Scheduled snapshot of `{target}` FAILED: {exc}")
+            return
+        pruned = res["pruned"]
+        await notify("backup", f"💾 Scheduled snapshot of `{target}` complete — {res['human']}"
+                               + (f" ({len(pruned)} old archive(s) pruned)." if pruned else "."))
     elif action in ("start", "stop", "restart"):
         # Tell the watchdog this one is on us, so a scheduled restart does not
         # read as a crash on the next tick.
@@ -1495,26 +1515,190 @@ async def _execute_job(action: str, target: str) -> None:
 # itself contain underscores, so the timestamp is matched from the right.
 _BACKUP_RE = re.compile(r'^(?P<server>.+)_(?P<stamp>\d{8}_\d{6})\.tar\.gz$')
 
+class BackupError(Exception):
+    pass
+
+
+def _backup_aliases() -> dict:
+    try:
+        with open(BACKUP_ALIASES_FILE) as f:
+            data = json.load(f)
+        return {str(k): str(v) for k, v in data.items()
+                if _NAME_RE.match(str(v))} if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _backup_dir(server: str, create: bool = False) -> str:
+    """Where one server's archives live: <BACKUP_ROOT>/<server>/Backups."""
+    if BACKUP_FLAT_DIR:
+        root, path = os.path.dirname(BACKUP_FLAT_DIR.rstrip("/")), BACKUP_FLAT_DIR
+    else:
+        root = BACKUP_ROOT
+        path = os.path.join(BACKUP_ROOT, _backup_aliases().get(server, server), "Backups")
+    if create:
+        # Only ever create below a root that already exists. The root lives on
+        # the backup disk, so if that disk is not mounted the root is missing
+        # and this refuses, rather than filling the system disk under the
+        # empty mountpoint.
+        if not os.path.isdir(root):
+            raise BackupError(f"{root} does not exist — is the backup disk mounted?")
+        os.makedirs(path, exist_ok=True)
+    return path
+
+
+def _backup_dirs() -> list[str]:
+    if BACKUP_FLAT_DIR:
+        return [BACKUP_FLAT_DIR] if os.path.isdir(BACKUP_FLAT_DIR) else []
+    out = []
+    try:
+        for entry in sorted(os.listdir(BACKUP_ROOT)):
+            d = os.path.join(BACKUP_ROOT, entry, "Backups")
+            if os.path.isdir(d):
+                out.append(d)
+    except OSError:
+        pass
+    return out
+
+
 def _backup_entries() -> list[dict]:
     rows = []
-    for fname in os.listdir(BACKUP_DIR):
-        if not fname.endswith(".tar.gz"):
+    for d in _backup_dirs():
+        try:
+            names = os.listdir(d)
+        except OSError:
             continue
-        full = os.path.join(BACKUP_DIR, fname)
+        for fname in names:
+            if not fname.endswith(".tar.gz"):
+                continue
+            full = os.path.join(d, fname)
+            try:
+                st = os.stat(full)
+            except OSError:
+                continue
+            m = _BACKUP_RE.match(fname)
+            rows.append({
+                "name":   fname,
+                "server": m.group("server") if m else "",
+                "size":   st.st_size,
+                "human":  _human(st.st_size),
+                "mtime":  int(st.st_mtime),
+                "dir":    d,
+                "path":   full,
+            })
+    rows.sort(key=lambda r: r["mtime"], reverse=True)
+    return rows
+
+
+def _find_backup(filename: str) -> str | None:
+    for row in _backup_entries():
+        if row["name"] == filename:
+            return row["path"]
+    return None
+
+
+# Everything the image re-downloads or regenerates on start. Leaving it out
+# keeps archives smaller and matches what mc-backup.sh (borg) excludes.
+BACKUP_EXCLUDES = ("libraries", "versions", ".fabric", "cache", ".cache", "logs",
+                   "crash-reports", "mc_venv", "__pycache__")
+_backups_running: set[str] = set()
+
+
+def _create_backup_blocking(name: str) -> dict:
+    server_path = safe_path(DATA_DIR, name)
+    if not os.path.isdir(server_path):
+        raise BackupError("server volume not found")
+    dest_dir = _backup_dir(name, create=True)
+
+    now = time.time()
+    newest = 0
+    for f in os.listdir(dest_dir):
+        full = os.path.join(dest_dir, f)
         try:
             st = os.stat(full)
         except OSError:
             continue
-        m = _BACKUP_RE.match(fname)
-        rows.append({
-            "name":   fname,
-            "server": m.group("server") if m else "",
-            "size":   st.st_size,
-            "human":  _human(st.st_size),
-            "mtime":  int(st.st_mtime),
-        })
-    rows.sort(key=lambda r: r["mtime"], reverse=True)
-    return rows
+        # A .part left by a run that was killed is never a restore point.
+        if f.endswith(".tar.gz.part") and now - st.st_mtime > 6 * 3600:
+            try:
+                os.remove(full)
+            except OSError:
+                pass
+        elif f.startswith(f"{name}_") and f.endswith(".tar.gz"):
+            newest = max(newest, st.st_size)
+    free = shutil.disk_usage(dest_dir).free
+    need = max(int(newest * 1.25), 1 << 30)
+    if free < need:
+        raise BackupError(f"only {_human(free)} free in {dest_dir}; "
+                          f"need about {_human(need)}")
+
+    ts    = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    final = os.path.join(dest_dir, f"{name}_{ts}.tar.gz")
+    part  = final + ".part"
+    warnings: list[str] = []
+
+    # Region files are rewritten in place. Archiving them while the server is
+    # mid-save gives a torn copy, so a running server is told to flush and
+    # hold its autosave for the duration.
+    quiesced = False
+    if _is_running(name):
+        if _rcon(name, "save-off", 20)[0] == 0:
+            quiesced = True
+            _rcon(name, "save-all flush", 120)
+            time.sleep(3)
+        else:
+            warnings.append("RCON did not answer, so autosave could not be paused — "
+                            "the world was archived while live")
+    try:
+        cmd = ["tar", "-czf", part, "--anchored"]
+        cmd += [f"--exclude={name}/{x}" for x in BACKUP_EXCLUDES]
+        cmd += ["--exclude=session.lock", "-C", DATA_DIR, name]
+        code, _, err = _run(cmd, 4 * 3600)
+    finally:
+        if quiesced:
+            _rcon(name, "save-on", 20)
+
+    # tar exits 1 for "file changed as we read it", which is survivable; 2 is not.
+    if code == 1:
+        warnings.append("some files changed while being read")
+    elif code != 0:
+        if os.path.exists(part):
+            os.remove(part)
+        raise BackupError(f"tar failed: {err.strip()[-300:] or f'exit {code}'}")
+
+    # Read it back before calling it a backup.
+    vcode, _, verr = _run(["gzip", "-t", part], 3600)
+    size = os.path.getsize(part) if os.path.exists(part) else 0
+    if vcode != 0 or size < 1024:
+        if os.path.exists(part):
+            os.remove(part)
+        raise BackupError(f"archive failed verification: {verr.strip()[-200:] or 'empty file'}")
+    os.replace(part, final)
+    return {"file": os.path.basename(final), "path": final, "dir": dest_dir,
+            "size": size, "human": _human(size), "quiesced": quiesced,
+            "warnings": warnings}
+
+
+async def _backup_server(name: str) -> dict:
+    """Archive one server, verify it, prune. Raises BackupError on any failure."""
+    if name in _backups_running:
+        raise BackupError("a backup of this server is already running")
+    _backups_running.add(name)
+    try:
+        res = await asyncio.to_thread(_create_backup_blocking, name)
+    except BackupError as exc:
+        audit("BACKUP_FAIL", name, str(exc)[:300])
+        raise
+    except Exception as exc:
+        audit("BACKUP_FAIL", name, f"{type(exc).__name__}: {exc}"[:300])
+        raise BackupError(f"{type(exc).__name__}: {exc}")
+    finally:
+        _backups_running.discard(name)
+    res["pruned"] = await asyncio.to_thread(_prune_backups, name)
+    audit("BACKUP", name, f"file={res['file']} size={res['human']} dir={res['dir']}"
+                          + (f" warnings={len(res['warnings'])}" if res["warnings"] else ""))
+    return res
+
 
 def _prune_backups(server: str | None = None, settings: dict | None = None,
                    dry_run: bool = False) -> list[str]:
@@ -1550,7 +1734,7 @@ def _prune_backups(server: str | None = None, settings: dict | None = None,
                 removed.append(row["name"])
                 continue
             try:
-                os.remove(os.path.join(BACKUP_DIR, row["name"]))
+                os.remove(row["path"])
                 removed.append(row["name"])
             except OSError:
                 pass
@@ -1915,6 +2099,10 @@ async def duplicate_server(request: Request, name: str = Path(...)):
 # ---------------------------------------------------------------------------
 UPDATER   = os.path.join(DATA_DIR, "mc-update.py")
 CHUNKDIFF = os.path.join(DATA_DIR, "mc-chunkdiff.py")
+UPDATE_LOG_DIR = os.path.join(DATA_DIR, "_update_snapshots")
+# A version update is a borg backup (up to 2h on a big world) plus a boot watch.
+UPDATE_TIMEOUT = 3 * 3600
+_ANSI_RE = re.compile(r'\x1b\[[0-9;]*[A-Za-z]')
 
 # An update takes a borg backup, recreates the container and then watches the
 # boot — minutes, not seconds. Holding the HTTP request open for that invites a
@@ -1933,6 +2121,43 @@ def _compose_service(name: str) -> str | None:
     return svc or None
 
 
+def _container_exists(name: str) -> bool:
+    return _run(["docker", "inspect", "-f", "{{.Id}}", name])[0] == 0
+
+
+def _updater_json(args: list[str], timeout: float) -> dict:
+    """Run mc-update.py --json and return its report.
+
+    The updater resolves which pack belongs to the server itself. This used to
+    leave --pack at its default, which was the crossplay pack for EVERY server:
+    checking any other server compared its jars against the wrong pack and
+    reported mods its own pack manages as "not managed by packwiz".
+    """
+    if not os.path.isfile(UPDATER):
+        raise HTTPException(503, "mc-update.py not found next to the server data.")
+    try:
+        r = subprocess.run([sys.executable, UPDATER, *args, "--json"], cwd=DATA_DIR,
+                           capture_output=True, text=True, stdin=subprocess.DEVNULL,
+                           check=False, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise HTTPException(504, f"The updater timed out after {int(timeout)} seconds.")
+    try:
+        report = json.loads(r.stdout)
+        if not isinstance(report, dict):
+            raise ValueError("not an object")
+    except ValueError:
+        detail = _ANSI_RE.sub("", (r.stderr or r.stdout or "")).strip()[-400:]
+        raise HTTPException(500, f"Updater produced no report: {detail or f'exit {r.returncode}'}")
+    return report
+
+
+def _valid_target(raw) -> str:
+    target = str(raw or "").strip()
+    if target and not re.match(r'^[0-9][0-9A-Za-z.\-_]{0,31}$', target):
+        raise HTTPException(400, "Invalid target version.")
+    return target
+
+
 @app.get("/api/server/{name}/update/options")
 async def update_options(name: str = Path(...)):
     """What this particular server can actually have updated, and why not."""
@@ -1942,25 +2167,29 @@ async def update_options(name: str = Path(...)):
         raise HTTPException(404, "Container volume missing.")
 
     service   = _compose_service(name)
-    has_pack  = os.path.isfile(os.path.join(server_path, "pack.toml"))
+    exists    = _container_exists(name)
     env       = _docker_env(name)
+    has_pack  = (os.path.isfile(os.path.join(server_path, "pack.toml"))
+                 or bool(env.get("PACKWIZ_URL")))
     level     = _server_property(server_path, "level-name", "world")
     has_world = os.path.isdir(os.path.join(server_path, level))
+    updater   = os.path.isfile(UPDATER)
 
     scopes = {
         "version": {
-            "available": bool(service) and os.path.isfile(UPDATER),
-            # mc-update.py rewrites the server's block in the compose file, so a
-            # container created by `docker run` has nothing for it to edit.
-            "reason": ("" if service else
-                       "Not compose-managed — mc-update.py edits a compose service "
-                       "block, which this container does not have.")
-                      if os.path.isfile(UPDATER) else "mc-update.py not found.",
+            # Compose-managed servers get their compose block edited; a
+            # container started with `docker run` (every server deployed from
+            # this UI) is recreated with the same ports, mounts and limits and
+            # a new VERSION. Both used to be required to be compose-managed.
+            "available": updater and exists,
+            "reason": ("" if exists else "The container does not exist.")
+                      if updater else "mc-update.py not found.",
         },
         "mods": {
-            "available": has_pack and bool(_packwiz_path()),
-            "reason": ("" if has_pack else "No pack.toml — run Set Up Packwiz first.")
-                      if _packwiz_path() else "packwiz is not installed.",
+            "available": has_pack and bool(_packwiz_path()) and updater,
+            "reason": (("" if has_pack else "No pack.toml — run Set Up Packwiz first.")
+                       if _packwiz_path() else "packwiz is not installed.")
+                      if updater else "mc-update.py not found.",
         },
         "world": {
             "available": has_world and os.path.isfile(CHUNKDIFF),
@@ -1971,6 +2200,7 @@ async def update_options(name: str = Path(...)):
     return JSONResponse({
         "server": name,
         "compose_service": service,
+        "managed_by": "compose" if service else "docker run",
         "current_version": env.get("VERSION", "unknown"),
         "loader": PACKWIZ_LOADERS.get(env.get("TYPE", "").upper(), "none"),
         "level_name": level,
@@ -1982,39 +2212,25 @@ async def update_options(name: str = Path(...)):
 async def update_check(request: Request, name: str = Path(...)):
     """Compatibility report only — never modifies the server."""
     validate_name(name)
-    if not os.path.isfile(UPDATER):
-        raise HTTPException(503, "mc-update.py not found next to the server data.")
+    if not os.path.isdir(safe_path(DATA_DIR, name)):
+        raise HTTPException(404, "Container volume missing.")
     data   = await request.json() if await request.body() else {}
-    target = str(data.get("target", "") or "").strip()
+    target = _valid_target(data.get("target"))
 
-    cmd = [sys.executable, UPDATER, "--server", name, "--check", "--json"]
+    args = ["--server", name, "--check"]
     if target:
-        if not re.match(r'^[0-9][0-9A-Za-z.\-_]{0,31}$', target):
-            raise HTTPException(400, "Invalid target version.")
-        cmd += ["--target", target]
+        args += ["--target", target]
+    elif data.get("snapshot"):
+        args.append("--latest-snapshot")
     else:
-        cmd.append("--latest")
-
-    def _run_check():
-        return subprocess.run(cmd, cwd=DATA_DIR, capture_output=True, text=True,
-                              stdin=subprocess.DEVNULL, check=False, timeout=300)
-    try:
-        r = await asyncio.to_thread(_run_check)
-    except subprocess.TimeoutExpired:
-        raise HTTPException(504, "Compatibility check timed out after 5 minutes.")
-
-    try:
-        report = json.loads(r.stdout)
-    except json.JSONDecodeError:
-        detail = (r.stderr or r.stdout or "").strip()[-400:]
-        raise HTTPException(500, f"Updater produced no report: {detail}")
-    return JSONResponse(report)
+        args.append("--latest")
+    if data.get("allow_loose_jars"):
+        args.append("--allow-loose-jars")
+    return JSONResponse(await asyncio.to_thread(_updater_json, args, 600))
 
 
 def _update_argv(name: str, scope: str, opts: dict) -> list[str]:
-    target = str(opts.get("target", "") or "").strip()
-    if target and not re.match(r'^[0-9][0-9A-Za-z.\-_]{0,31}$', target):
-        raise HTTPException(400, "Invalid target version.")
+    target = _valid_target(opts.get("target"))
 
     if scope == "version":
         cmd = [sys.executable, UPDATER, "--server", name, "--update"]
@@ -2029,8 +2245,13 @@ def _update_argv(name: str, scope: str, opts: dict) -> list[str]:
         return cmd
 
     if scope == "mods":
-        packwiz = _require_packwiz()
-        return [packwiz, "update", "--all", "-y"]
+        # Raw `packwiz update --all` only rewrote the .pw.toml files: the new
+        # jars were never downloaded and the old ones never removed, so the
+        # pack then listed jars that were not there. The updater adopts
+        # untracked jars, updates, downloads, retires the old jars, and rolls
+        # the lot back if any step fails.
+        _require_packwiz()
+        return [sys.executable, UPDATER, "--server", name, "--update-mods"]
 
     if scope == "world":
         # Deliberately only `plan`. mc-chunkdiff is a three-stage workflow:
@@ -2049,6 +2270,39 @@ def _update_argv(name: str, scope: str, opts: dict) -> list[str]:
     raise HTTPException(400, "Scope must be one of: version, mods, world.")
 
 
+def _run_streaming(argv: list[str], cwd: str, run: dict) -> int:
+    """Run a long job, feeding its output into `run` line by line.
+
+    The log used to appear only once the job had finished, so a ten-minute
+    update showed an empty box for ten minutes.
+    """
+    env = {**os.environ, "PYTHONUNBUFFERED": "1"}
+    proc = subprocess.Popen(argv, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            stdin=subprocess.DEVNULL, text=True, errors="replace", env=env)
+    run["pid"] = proc.pid
+    # SIGTERM, not kill: the updater turns it into a rollback.
+    timer = threading.Timer(UPDATE_TIMEOUT, proc.terminate)
+    timer.daemon = True
+    timer.start()
+    try:
+        for line in proc.stdout:
+            run["output"] = (run["output"] + _ANSI_RE.sub("", line))[-40000:]
+        return proc.wait()
+    finally:
+        timer.cancel()
+
+
+def _save_update_log(name: str, run: dict) -> None:
+    try:
+        os.makedirs(UPDATE_LOG_DIR, exist_ok=True)
+        tmp = os.path.join(UPDATE_LOG_DIR, f".{name}-last.json.tmp")
+        with open(tmp, "w") as f:
+            json.dump(run, f)
+        os.replace(tmp, os.path.join(UPDATE_LOG_DIR, f"{name}-last.json"))
+    except OSError:
+        pass
+
+
 @app.post("/api/server/{name}/update/apply")
 async def update_apply(request: Request, name: str = Path(...)):
     validate_name(name)
@@ -2059,46 +2313,48 @@ async def update_apply(request: Request, name: str = Path(...)):
     if not os.path.isdir(server_path):
         raise HTTPException(404, "Container volume missing.")
 
-    if scope == "version" and not _compose_service(name):
-        raise HTTPException(
-            409, "This server is not compose-managed, so mc-update.py has no "
-                 "service block to update. Mods and world scopes still work.")
-    if scope == "version" and not os.path.isfile(UPDATER):
+    if scope in ("version", "mods") and not os.path.isfile(UPDATER):
         raise HTTPException(503, "mc-update.py not found next to the server data.")
+    if scope == "version" and not _container_exists(name):
+        raise HTTPException(409, "The container does not exist, so there is nothing to recreate.")
     if scope == "world" and not os.path.isfile(CHUNKDIFF):
         raise HTTPException(503, "mc-chunkdiff.py not found next to the server data.")
 
     argv = _update_argv(name, scope, data)
-    cwd  = server_path if scope == "mods" else DATA_DIR
 
     async with _update_lock:
         running = _update_runs.get(name)
         if running and running.get("state") == "running":
             raise HTTPException(409, f"An update is already running for '{name}'.")
-        _update_runs[name] = {
+        run = _update_runs[name] = {
             "state": "running", "scope": scope, "output": "",
             "started": datetime.datetime.now().isoformat(timespec="seconds"),
             "returncode": None,
         }
 
     async def _worker():
+        # A version update stops and recreates the container on purpose; the
+        # watchdog must not read that as a crash and start the old container
+        # underneath the updater.
+        if scope == "version":
+            _mark_intentional(name)
         try:
-            r = await asyncio.to_thread(
-                lambda: subprocess.run(argv, cwd=cwd, capture_output=True, text=True,
-                                       stdin=subprocess.DEVNULL, check=False,
-                                       timeout=3600))
-            out = ((r.stdout or "") + "\n" + (r.stderr or "")).strip()
-            state = "done" if r.returncode == 0 else "failed"
-            rc = r.returncode
-        except subprocess.TimeoutExpired:
-            out, state, rc = "Update timed out after 1 hour.", "failed", -1
+            rc = await asyncio.to_thread(_run_streaming, argv, DATA_DIR, run)
+            state = "done" if rc == 0 else "failed"
         except Exception as exc:
-            out, state, rc = f"Update could not start: {exc}", "failed", -1
+            run["output"] += f"\nUpdate could not start: {exc}"
+            state, rc = "failed", -1
+        finally:
+            _intentional_stops.discard(name)
         async with _update_lock:
-            _update_runs[name].update(
-                {"state": state, "output": out[-20000:], "returncode": rc,
-                 "finished": datetime.datetime.now().isoformat(timespec="seconds")})
+            run.update({"state": state, "returncode": rc,
+                        "finished": datetime.datetime.now().isoformat(timespec="seconds")})
+            run.pop("pid", None)
+        _save_update_log(name, run)
         audit("UPDATE", name, f"scope={scope} result={state} rc={rc}")
+        if scope in ("version", "mods"):
+            await notify("", (f"⬆️ `{name}` {scope} update finished." if state == "done" else
+                              f"⚠️ `{name}` {scope} update FAILED (exit {rc}) — see the update log."))
 
     asyncio.create_task(_worker())
     return JSONResponse({"message": f"{scope.capitalize()} update started for '{name}'.",
@@ -2109,9 +2365,19 @@ async def update_apply(request: Request, name: str = Path(...)):
 async def update_status(name: str = Path(...)):
     validate_name(name)
     run = _update_runs.get(name)
-    if not run:
-        return JSONResponse({"state": "idle"})
-    return JSONResponse(run)
+    if run:
+        return JSONResponse(run)
+    # The in-memory state does not survive a manager restart; the last
+    # finished run is kept on disk so its log is still there to read.
+    try:
+        with open(os.path.join(UPDATE_LOG_DIR, f"{name}-last.json")) as f:
+            saved = json.load(f)
+        if isinstance(saved, dict):
+            saved["from_disk"] = True
+            return JSONResponse(saved)
+    except (OSError, ValueError):
+        pass
+    return JSONResponse({"state": "idle"})
 
 
 @app.post("/api/server/{name}/action")
@@ -2766,6 +3032,54 @@ async def packwiz_state(name: str = Path(...)):
         "has_pack": os.path.isfile(os.path.join(server_path, "pack.toml")),
     })
 
+@app.get("/api/server/{name}/packwiz/untracked")
+async def packwiz_untracked(name: str = Path(...)):
+    """Jars in mods/ that the pack does not list, and what can be done with each.
+
+    A jar that was downloaded from Modrinth by any other route (a pack synced
+    from elsewhere, a manual upload) is invisible to packwiz, so packwiz never
+    updates it. Modrinth can identify such a file by its hash.
+    """
+    validate_name(name)
+    if not os.path.isdir(safe_path(DATA_DIR, name)):
+        raise HTTPException(404, "Container volume missing.")
+    report = await asyncio.to_thread(_updater_json, ["--server", name, "--scan"], 300)
+    if not report.get("ok"):
+        raise HTTPException(502, report.get("error") or "Scan failed.")
+    jars = report.get("loose_jars") or []
+    return JSONResponse({
+        "jars": jars,
+        "managed": report.get("managed", 0),
+        "adoptable": sum(1 for j in jars if j.get("status") == "adoptable"),
+        "duplicates": sum(1 for j in jars if j.get("status") == "superseded"),
+        "untrackable": sum(1 for j in jars
+                           if j.get("status") not in ("adoptable", "superseded")),
+    })
+
+
+@app.post("/api/server/{name}/packwiz/adopt")
+async def packwiz_adopt(name: str = Path(...)):
+    """Write pack metadata for every untracked jar Modrinth recognises."""
+    validate_name(name)
+    if not os.path.isdir(safe_path(DATA_DIR, name)):
+        raise HTTPException(404, "Container volume missing.")
+    _require_packwiz()
+    report = await asyncio.to_thread(_updater_json, ["--server", name, "--adopt"], 600)
+    if not report.get("ok"):
+        raise HTTPException(502, report.get("error") or "Adopt failed.")
+    adopted, retired = report.get("adopted") or [], report.get("retired") or []
+    left = report.get("untracked") or []
+    audit("PACKWIZ_ADOPT", name,
+          f"adopted={len(adopted)} retired={len(retired)} untracked={len(left)}")
+    bits = [f"adopted {len(adopted)} jar(s) into the pack"]
+    if retired:
+        bits.append(f"moved {len(retired)} stale duplicate(s) to _mods_replaced/")
+    if left:
+        bits.append(f"{len(left)} not on Modrinth and left as they are")
+    return JSONResponse({"message": "Packwiz: " + ", ".join(bits) + ".",
+                         "adopted": adopted, "retired": retired, "untracked": left})
+
+
 @app.get("/api/packwiz/status")
 async def packwiz_status():
     path = _packwiz_path()
@@ -2838,32 +3152,38 @@ async def upload_datapack(name: str = Path(...), file: UploadFile = File(...)):
 @app.post("/api/server/{name}/backup")
 async def trigger_backup(name: str = Path(...)):
     validate_name(name)
-    server_path = safe_path(DATA_DIR, name)
-    if not os.path.exists(server_path):
+    if not os.path.exists(safe_path(DATA_DIR, name)):
         raise HTTPException(404, "Server volume not found.")
-    ts          = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    backup_file = os.path.join(BACKUP_DIR, f"{name}_{ts}.tar.gz")
-    code, _, err = _run(["tar", "-czf", backup_file, "-C", DATA_DIR, name])
-    if code != 0:
-        raise HTTPException(500, f"tar failed: {err}")
-    pruned = await asyncio.to_thread(_prune_backups, name)
-    audit("BACKUP", name, f"file={os.path.basename(backup_file)}")
-    await notify("backup", f"💾 Snapshot of `{name}` captured.")
-    msg = f"Snapshot created: {os.path.basename(backup_file)}"
-    if pruned:
-        msg += f" — {len(pruned)} old archive(s) pruned."
-    return JSONResponse({"message": msg, "pruned": pruned})
+    # tar used to run on the event loop, freezing the whole UI (and every
+    # websocket) for the minutes a multi-GB archive takes.
+    try:
+        res = await _backup_server(name)
+    except BackupError as exc:
+        await notify("", f"⚠️ Snapshot of `{name}` FAILED: {exc}")
+        raise HTTPException(500, f"Backup failed: {exc}")
+    await notify("backup", f"💾 Snapshot of `{name}` captured ({res['human']}).")
+    msg = f"Snapshot created: {res['file']} ({res['human']}) in {res['dir']}"
+    if res["warnings"]:
+        msg += " — warning: " + "; ".join(res["warnings"])
+    if res["pruned"]:
+        msg += f" — {len(res['pruned'])} old archive(s) pruned."
+    return JSONResponse({"message": msg, "pruned": res["pruned"], "file": res["file"],
+                         "dir": res["dir"], "warnings": res["warnings"]})
 
 @app.get("/api/backups")
 async def list_backups():
-    rows  = _backup_entries()
+    rows  = [{k: v for k, v in r.items() if k != "path"} for r in _backup_entries()]
     total = sum(r["size"] for r in rows)
+    root  = BACKUP_FLAT_DIR or BACKUP_ROOT
     return JSONResponse({
         # Plain filenames kept for anything still reading the old shape.
         "backups": [r["name"] for r in rows],
         "entries": rows,
         "total": total,
         "total_human": _human(total),
+        "root": root,
+        "layout": "flat" if BACKUP_FLAT_DIR else "<root>/<server>/Backups",
+        "root_available": os.path.isdir(root),
         "settings": {k: _load_settings()[k] for k in
                      ("backup_keep_count", "backup_keep_days", "backup_prune_enabled")},
     })
@@ -2872,8 +3192,8 @@ async def list_backups():
 async def delete_backup(filename: str = Path(...)):
     if not filename.endswith(".tar.gz") or "/" in filename or "\\" in filename:
         raise HTTPException(400, "Invalid backup filename.")
-    path = os.path.join(BACKUP_DIR, filename)
-    if not os.path.exists(path):
+    path = _find_backup(filename)
+    if not path:
         raise HTTPException(404, "Backup not found.")
     try:
         os.remove(path)
@@ -2893,33 +3213,101 @@ async def prune_backups(request: Request):
     verb = "would be removed" if dry_run else "removed"
     return JSONResponse({"message": f"{len(removed)} archive(s) {verb}.", "removed": removed})
 
+
+def _restore_blocking(name: str, backup_path: str) -> str:
+    """Put an archive back without ever being left with no server directory.
+
+    The old restore deleted the live directory FIRST and extracted second, so
+    a truncated archive — or a full disk halfway through — left nothing at
+    all. It also extracted whatever the archive contained: restoring another
+    server's archive wiped the selected server and then overwrote the other
+    one's live files. Now the archive is checked, extracted to one side, and
+    only swapped in once it is complete; the directory it replaces is kept.
+    """
+    server_path = safe_path(DATA_DIR, name)
+
+    # 1. The archive must hold exactly this server and nothing that escapes it.
+    proc = subprocess.Popen(["tar", "-tzf", backup_path], stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, text=True, errors="replace")
+    members, foreign = 0, None
+    for line in proc.stdout:
+        member = line.rstrip("\n")
+        top = member.split("/", 1)[0]
+        if top != name or ".." in member.split("/") or member.startswith("/"):
+            foreign = foreign or member
+        members += 1
+    err = proc.stderr.read()
+    if proc.wait() != 0:
+        raise HTTPException(500, f"The archive is unreadable — nothing was changed: "
+                                 f"{err.strip()[-200:]}")
+    if foreign is not None:
+        top = foreign.split("/", 1)[0]
+        raise HTTPException(
+            400, f"This archive is a backup of '{top}', not '{name}'. Select '{top}' to "
+                 f"restore it — nothing was changed.")
+    if members == 0:
+        raise HTTPException(500, "The archive is empty — nothing was changed.")
+
+    # 2. Extract beside the live directory (same filesystem, so the swap is a rename).
+    ts    = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    stage = os.path.join(DATA_DIR, f"_restore_stage_{name}_{ts}")
+    kept  = os.path.join(DATA_DIR, f"_pre_restore_{name}_{ts}")
+    os.makedirs(stage)
+    code, _, err = _run(["tar", "-xzf", backup_path, "-C", stage], 4 * 3600)
+    if code != 0 or not os.path.isdir(os.path.join(stage, name)):
+        shutil.rmtree(stage, ignore_errors=True)
+        raise HTTPException(500, f"Extraction failed — nothing was changed: {err.strip()[-200:]}")
+
+    # 3. Stop, swap, start.
+    existed = _container_exists(name)
+    if existed:
+        _run(["docker", "stop", "-t", "90", name], 180)
+    try:
+        if os.path.isdir(server_path):
+            os.rename(server_path, kept)
+        os.rename(os.path.join(stage, name), server_path)
+    except OSError as exc:
+        if not os.path.isdir(server_path) and os.path.isdir(kept):
+            os.rename(kept, server_path)          # put the original back
+        shutil.rmtree(stage, ignore_errors=True)
+        if existed:
+            _run(["docker", "start", name], 120)
+        raise HTTPException(500, f"Could not swap the restored files in — the server "
+                                 f"is as it was: {exc}")
+    shutil.rmtree(stage, ignore_errors=True)
+
+    # Keep only the newest pre-restore copy per server: it is a safety net,
+    # not an archive, and a world is too big to accumulate on the system disk.
+    prefix = f"_pre_restore_{name}_"
+    for old in sorted(d for d in os.listdir(DATA_DIR) if d.startswith(prefix))[:-1]:
+        shutil.rmtree(os.path.join(DATA_DIR, old), ignore_errors=True)
+
+    if existed:
+        _run(["docker", "start", name], 120)
+    return os.path.basename(kept) if os.path.isdir(kept) else ""
+
+
 @app.post("/api/server/{name}/restore")
 async def restore_backup(request: Request, name: str = Path(...)):
     validate_name(name)
     data     = await request.json()
     filename = data.get("filename", "")
-    # Validate filename: must end in .tar.gz and live inside BACKUP_DIR
     if not filename.endswith(".tar.gz") or "/" in filename or "\\" in filename:
         raise HTTPException(400, "Invalid backup filename.")
-    backup_path = os.path.join(BACKUP_DIR, filename)
-    if not os.path.exists(backup_path):
+    backup_path = _find_backup(filename)
+    if not backup_path:
         raise HTTPException(404, f"Backup '{filename}' not found.")
+    if name in _backups_running:
+        raise HTTPException(409, "A backup of this server is running — try again when it finishes.")
 
-    server_path = safe_path(DATA_DIR, name)
-
-    # Stop the container first
-    _run(["docker", "stop", name])
-
-    # Remove existing data dir and re-extract
-    shutil.rmtree(server_path, ignore_errors=True)
-    code, _, err = _run(["tar", "-xzf", backup_path, "-C", DATA_DIR])
-    if code != 0:
-        raise HTTPException(500, f"Restore failed: {err}")
-
-    # Restart the container
-    _run(["docker", "start", name])
-    audit("RESTORE", name, f"file={filename}")
-    return JSONResponse({"message": f"Restored '{filename}' to '{name}' and restarted."})
+    _mark_intentional(name)
+    try:
+        kept = await asyncio.to_thread(_restore_blocking, name, backup_path)
+    finally:
+        _intentional_stops.discard(name)
+    audit("RESTORE", name, f"file={filename} previous={kept or '-'}")
+    note = f" The files it replaced are kept in {kept}/ until the next restore." if kept else ""
+    return JSONResponse({"message": f"Restored '{filename}' to '{name}' and restarted.{note}"})
 
 # ---------------------------------------------------------------------------
 # REST — Audit log

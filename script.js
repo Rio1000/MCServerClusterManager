@@ -1172,8 +1172,8 @@ async function openUpdate(name) {
   document.getElementById('upd-current').textContent = opt.current_version || '?';
 
   const labels = {
-    version: ['Server version', 'Resolves a target version, verifies every mod against it, takes a borg backup, then recreates the container.'],
-    mods:    ['Mods', 'Runs packwiz update across the pack, pulling the newest build of each mod for the current version.'],
+    version: ['Server version', 'Resolves a target version, verifies every mod against it, adopts untracked Modrinth jars into the pack, takes a verified borg backup, then recreates the container and watches the boot. Any failure puts the pack, the jars and the container definition back.'],
+    mods:    ['Mods', 'Adopts untracked Modrinth jars into the pack, then pulls the newest build of every mod for the current version. New jars are hash-checked before the old ones are moved to _mods_replaced/. The server is not restarted.'],
     world:   ['World / chunks (plan only)', 'Runs mc-chunkdiff.py plan — reads the seed, datapacks and version out of the live world and prints the recipe for building a reference. Read-only. Deleting untouched chunks is a separate, deliberate step on the command line.'],
   };
 
@@ -1216,7 +1216,7 @@ async function runUpdateCheck() {
 
   const res = await fetch(`/api/server/${encodeURIComponent(updateTarget)}/update/check`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ target }),
+    body: JSON.stringify({ target, ...updateFlags() }),
   }).catch(() => null);
 
   if (!res) { report.innerHTML = '<div class="empty">Network error.</div>'; return; }
@@ -1226,19 +1226,54 @@ async function runUpdateCheck() {
     return;
   }
 
+  if (d.error && !(d.blockers || []).length) {
+    report.innerHTML = `<div class="empty err">${escapeHtml(d.error)}</div>`;
+    return;
+  }
+
   const blockers = d.blockers || [];
   const verdict = d.up_to_date
     ? `Already on ${escapeHtml(d.current)} — nothing to do.`
     : d.can_update
       ? `${escapeHtml(d.current)} → ${escapeHtml(d.target)}: all ${(d.mods || []).length} mods resolve.`
-      : `${escapeHtml(d.current)} → ${escapeHtml(d.target)} is blocked by ${blockers.length} mod(s).`;
+      : `${escapeHtml(d.current)} → ${escapeHtml(d.target)} is blocked by ${blockers.length} problem(s).`;
+
+  // loose_jars used to be joined as if it were a list of names; it is a list
+  // of objects, so the hint read "[object Object], [object Object]".
+  const loose = d.loose_jars || [];
+  const by = st => loose.filter(j => j.status === st);
+  const adoptable = by('adoptable'), dupes = by('superseded'), fine = by('ok');
+  const stuck = loose.filter(j => !['adoptable', 'superseded', 'ok'].includes(j.status));
+  const jarList = rows => rows.map(j =>
+    `<li><code>${escapeHtml(j.jar)}</code> — ${escapeHtml(j.detail || j.status)}${
+      j.target_version ? ` (→ ${escapeHtml(j.target_version)})` : ''}</li>`).join('');
+  const looseHtml = !loose.length ? '' : `
+    <div class="card-hint" style="margin-top:6px;">
+      ${loose.length} jar(s) in mods/ are not in the packwiz pack${
+        d.pack ? ` (<code>${escapeHtml(d.pack)}</code>)` : ''}:</div>
+    ${adoptable.length ? `<div class="card-hint">${adoptable.length} found on Modrinth —
+      adopted into the pack automatically when the update runs:</div>
+      <ul class="upd-blockers">${jarList(adoptable)}</ul>` : ''}
+    ${dupes.length ? `<div class="card-hint">${dupes.length} stale duplicate(s) —
+      moved to _mods_replaced/ when the update runs:</div>
+      <ul class="upd-blockers">${jarList(dupes)}</ul>` : ''}
+    ${fine.length ? `<div class="card-hint">${fine.length} not on Modrinth but declaring
+      a compatible Minecraft version — left as they are, packwiz will not update them:</div>
+      <ul class="upd-blockers">${jarList(fine)}</ul>` : ''}
+    ${stuck.length ? `<div class="card-hint" style="color:var(--warn,#c90);">${stuck.length}
+      that nothing can vouch for — replace them, or tick "Allow unverifiable jars":</div>
+      <ul class="upd-blockers">${jarList(stuck)}</ul>` : ''}`;
 
   report.innerHTML = `
     <div class="srv-meta" style="margin-bottom:6px;">${verdict}</div>
     ${blockers.length ? `<ul class="upd-blockers">${
       blockers.map(b => `<li>${escapeHtml(b)}</li>`).join('')}</ul>` : ''}
-    ${(d.loose_jars || []).length ? `<div class="card-hint">Loose jars packwiz cannot
-       track: ${escapeHtml((d.loose_jars || []).join(', '))}</div>` : ''}`;
+    ${looseHtml}`;
+}
+
+function updateFlags() {
+  const on = id => { const el = document.getElementById(id); return !!(el && el.checked); };
+  return { allow_loose_jars: on('upd-allow-loose'), snapshot: on('upd-snapshot') };
 }
 
 async function runUpdateApply() {
@@ -1246,7 +1281,8 @@ async function runUpdateApply() {
   const scope = selectedScope();
   if (!scope) { toast('Pick what to update.', 'error'); return; }
 
-  const body = { scope, target: document.getElementById('upd-target').value.trim() };
+  const body = { scope, target: document.getElementById('upd-target').value.trim(),
+                 ...updateFlags() };
   if (scope === 'world') body.dimension = document.getElementById('upd-dimension').value;
 
   if (scope === 'version' &&
@@ -1284,7 +1320,10 @@ async function pollUpdateStatus(once) {
 
     if (d.state === 'idle') { badge.textContent = ''; return; }
     badge.textContent = `${d.scope || ''} — ${d.state}`;
-    if (d.output) log.textContent = d.output;
+    if (d.output && log.textContent !== d.output) {
+      log.textContent = d.output;
+      log.scrollTop = log.scrollHeight;    // output now streams; follow it
+    }
 
     if (d.state !== 'running') {
       if (updatePoll) { clearInterval(updatePoll); updatePoll = null; }
@@ -2589,6 +2628,65 @@ async function loadPackState() {
     ? `<span class="err">${d.total} mod(s) in the pack, ${missing} with no jar on disk —`
       + ' the server cannot load those.</span>'
     : `<span class="ok">${d.total} mod(s) in the pack, all present.</span>`;
+  loadUntracked();
+}
+
+// ---------------------------------------------------------------------------
+// Untracked jars — in mods/, but not in the pack
+//
+// A jar that reached the server by any route other than "add" on this page is
+// invisible to packwiz, so packwiz never updates it and the version updater
+// used to refuse to run because of it. Modrinth can identify such a file by
+// hash; adopting it writes the missing .pw.toml.
+// ---------------------------------------------------------------------------
+async function loadUntracked() {
+  const el = document.getElementById('untracked-state');
+  const btn = document.getElementById('btn-adopt');
+  if (!el || !btn || !activeServer) return;
+  const server = activeServer;
+  el.textContent = 'Checking for jars the pack does not track…';
+  btn.disabled = true;
+
+  const res = await fetch(`/api/server/${server}/packwiz/untracked`).catch(() => null);
+  if (server !== activeServer) return;
+  const d = res ? await res.json().catch(() => ({})) : {};
+  if (!res || !res.ok) {
+    el.innerHTML = `<span class="err">${escapeHtml(d.detail || 'Could not scan the mods folder.')}</span>`;
+    return;
+  }
+  const jars = d.jars || [];
+  if (!jars.length) {
+    el.innerHTML = '<span class="ok">Every jar in mods/ is tracked by the pack.</span>';
+    btn.textContent = 'NOTHING TO ADOPT';
+    return;
+  }
+  const todo = (d.adoptable || 0) + (d.duplicates || 0);
+  btn.disabled = todo === 0;
+  btn.textContent = todo ? `ADOPT ${d.adoptable} JAR${d.adoptable === 1 ? '' : 'S'}`
+    + (d.duplicates ? ` + RETIRE ${d.duplicates} DUPLICATE${d.duplicates === 1 ? '' : 'S'}` : '')
+    : 'NOTHING TO ADOPT';
+  el.innerHTML = `<span class="${todo ? 'err' : 'ok'}">${jars.length} jar(s) the pack does not
+    track: ${d.adoptable} on Modrinth, ${d.duplicates} duplicate(s),
+    ${d.untrackable} not on Modrinth.</span>
+    <ul class="upd-blockers">${jars.map(j =>
+      `<li><code>${escapeHtml(j.jar)}</code> — ${escapeHtml(j.detail || j.status)}</li>`).join('')}</ul>`;
+}
+
+async function adoptUntracked() {
+  if (!activeServer) { toast('Select a server first.', 'error'); return; }
+  const btn = document.getElementById('btn-adopt');
+  btn.disabled = true;
+  btn.textContent = 'ADOPTING…';
+  const data = await apiCall(`/api/server/${activeServer}/packwiz/adopt`, { method: 'POST' });
+  if (data) {
+    (data.adopted || []).forEach(a => logTerm(`  + ${a.jar} → ${a.meta}`));
+    (data.retired || []).forEach(r => logTerm(`  · ${r.jar} moved to ${r.moved_to}/`));
+    (data.untracked || []).forEach(u => logTerm(`  ! ${u.jar} — ${u.detail}`, true));
+    logTerm(data.message);
+    toast(data.message, 'ok');
+  }
+  loadInstalledAddons();
+  loadPackState();
 }
 
 async function syncPack() {
@@ -2635,12 +2733,15 @@ async function loadBackups() {
 
   const rows = data.entries || [];
   container.innerHTML = !rows.length
-    ? '<div class="empty">No archives found in the _backups directory.</div>'
+    ? `<div class="empty">${data.root_available === false
+        ? `Backup location ${escapeHtml(data.root || '')} is not available — is the disk mounted?`
+        : `No archives found under ${escapeHtml(data.root || 'the backup directory')}.`}</div>`
     : rows.map(b => `
         <div class="list-row" data-backup="${escapeHtml(b.name)}">
           <div class="row-main">
             <div class="mono">${escapeHtml(b.name)}</div>
-            <div class="row-sub">${escapeHtml(b.human)} · ${escapeHtml(fmtTime(b.mtime))}</div>
+            <div class="row-sub">${escapeHtml(b.human)} · ${escapeHtml(fmtTime(b.mtime))}${
+              b.dir ? ` · ${escapeHtml(b.dir)}` : ''}</div>
           </div>
           <button class="mc-btn orange sm" data-act="restore">RESTORE</button>
           <button class="mc-btn red sm" data-act="delete-backup">DEL</button>

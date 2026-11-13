@@ -654,6 +654,14 @@
                 <button id="btn-pack-sync" class="mc-btn block" onclick="syncPack()">
                   DOWNLOAD MISSING JARS</button>
 
+                <h4 class="section-heading">Untracked Jars</h4>
+                <p class="card-hint">Jars in <code>mods/</code> that the pack does not list are
+                  never updated by packwiz. Those that came from Modrinth are recognised by
+                  their hash and can be adopted, so updates cover them too.</p>
+                <div id="untracked-state" class="status-line">&hellip;</div>
+                <button id="btn-adopt" class="mc-btn block" onclick="adoptUntracked()" disabled>
+                  ADOPT UNTRACKED JARS</button>
+
                 <h4 class="section-heading">Modrinth</h4>
                 <div class="field">
                   <label class="field-lbl" for="mod-slug">Modrinth Slug</label>
@@ -1137,13 +1145,25 @@
             </div>
           </div>
 
+          <label class="check-row" style="margin-top:8px;">
+            <input type="checkbox" id="upd-snapshot">
+            <span>Target the latest snapshot when no version is typed</span>
+          </label>
+          <label class="check-row">
+            <input type="checkbox" id="upd-allow-loose">
+            <span>Allow unverifiable jars — proceed even if a jar that is not on Modrinth
+              declares no compatible Minecraft version</span>
+          </label>
+
           <div class="btn-row" style="margin-top:8px;">
             <button class="mc-btn" onclick="runUpdateCheck()">Check Compatibility</button>
             <button id="btn-upd-go" class="mc-btn green" onclick="runUpdateApply()">Run Update</button>
           </div>
           <p class="card-hint" style="margin-top:6px;">
-            A version update takes a borg backup first and restores it if the server
-            fails to boot. The check is read-only and always safe to run.
+            A version update takes a verified borg backup first. If the server fails to
+            boot, the pack, jars and container definition are put back, and the previous
+            version is restarted when the world was never opened. The check is read-only
+            and always safe to run.
           </p>
 
           <div id="upd-report" style="margin-top:10px;"></div>
