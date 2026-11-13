@@ -2097,7 +2097,14 @@ async def duplicate_server(request: Request, name: str = Path(...)):
 # ---------------------------------------------------------------------------
 # REST — Updates (delegates to the existing mc-update.py / mc-chunkdiff.py)
 # ---------------------------------------------------------------------------
-UPDATER   = os.path.join(DATA_DIR, "mc-update.py")
+# The updater ships with the manager. A copy beside the server data is still
+# honoured for an install that predates it moving into this repository.
+_UPDATER_HERE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mc-update.py")
+UPDATER   = _UPDATER_HERE if os.path.isfile(_UPDATER_HERE) \
+    else os.path.join(DATA_DIR, "mc-update.py")
+# The updater must work on the same data dir this process does, however that
+# was decided here.
+UPDATER_ENV = {**os.environ, "MCSCM_DATA_DIR": DATA_DIR}
 CHUNKDIFF = os.path.join(DATA_DIR, "mc-chunkdiff.py")
 UPDATE_LOG_DIR = os.path.join(DATA_DIR, "_update_snapshots")
 # A version update is a borg backup (up to 2h on a big world) plus a boot watch.
@@ -2138,7 +2145,7 @@ def _updater_json(args: list[str], timeout: float) -> dict:
     try:
         r = subprocess.run([sys.executable, UPDATER, *args, "--json"], cwd=DATA_DIR,
                            capture_output=True, text=True, stdin=subprocess.DEVNULL,
-                           check=False, timeout=timeout)
+                           check=False, timeout=timeout, env=UPDATER_ENV)
     except subprocess.TimeoutExpired:
         raise HTTPException(504, f"The updater timed out after {int(timeout)} seconds.")
     try:
@@ -2276,7 +2283,7 @@ def _run_streaming(argv: list[str], cwd: str, run: dict) -> int:
     The log used to appear only once the job had finished, so a ten-minute
     update showed an empty box for ten minutes.
     """
-    env = {**os.environ, "PYTHONUNBUFFERED": "1"}
+    env = {**UPDATER_ENV, "PYTHONUNBUFFERED": "1"}
     proc = subprocess.Popen(argv, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                             stdin=subprocess.DEVNULL, text=True, errors="replace", env=env)
     run["pid"] = proc.pid
