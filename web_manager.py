@@ -1507,6 +1507,82 @@ async def _execute_job(action: str, target: str) -> None:
         if action in ("stop", "restart"):
             _mark_intentional(target)
         await asyncio.to_thread(_run, ["docker", action, target])
+    elif action in SCHEDULED_MOD_UPDATES:
+        await _scheduled_mod_update(action, target)
+
+
+# Scheduled single-mod updates. Geyser has to track the Bedrock client: when
+# Bedrock ships a new version, players on it cannot join until Geyser does too,
+# and that happens far more often than a Minecraft Java release. Floodgate is
+# released alongside it and the two are kept in step.
+SCHEDULED_MOD_UPDATES = {
+    "update-geyser": ("Geyser", ["geyser", "floodgate"]),
+}
+_ONLINE_RE = re.compile(r'There are (\d+) of a max', re.I)
+
+
+def _players_online(name: str) -> int | None:
+    """How many players are connected, or None if RCON would not say."""
+    code, out, _ = _rcon(name, "list", 20)
+    m = _ONLINE_RE.search(out or "") if code == 0 else None
+    return int(m.group(1)) if m else None
+
+
+async def _scheduled_mod_update(action: str, target: str) -> dict:
+    """Update the named pack entries; restart only if it is safe to.
+
+    The updater does the work — it downloads and hash-checks the new jar before
+    retiring the old one, and puts everything back if any step fails — so a bad
+    night on Modrinth leaves the server exactly as it was.
+    """
+    label, entries = SCHEDULED_MOD_UPDATES[action]
+    running_update = _update_runs.get(target)
+    if running_update and running_update.get("state") == "running":
+        audit("MOD_UPDATE_SKIP", target, f"{label}: another update is running")
+        return {"ok": False, "error": "another update is running"}
+    try:
+        report = await asyncio.to_thread(
+            _updater_json,
+            ["--server", target, "--update-mods", "--only", ",".join(entries)], 1800)
+    except HTTPException as exc:
+        report = {"ok": False, "error": str(exc.detail)}
+    if not report.get("ok"):
+        err = str(report.get("error") or "unknown error")[:300]
+        audit("MOD_UPDATE_FAIL", target, f"{label}: {err}")
+        await notify("", f"⚠️ Scheduled {label} update on `{target}` FAILED: {err}")
+        return report
+
+    changes = report.get("mod_changes") or []
+    if not changes:
+        audit("MOD_UPDATE", target, f"{label}: already up to date")
+        return report
+    summary = "; ".join(f"{c['from']} -> {c['to']}" for c in changes)
+
+    # A new jar only loads on a start. Restart now if nobody would be kicked;
+    # otherwise leave it for the next restart rather than dropping players for
+    # an update they did not ask for.
+    restarted, why = False, ""
+    if not await asyncio.to_thread(_is_running, target):
+        why = "server is stopped; loads on next start"
+    else:
+        online = await asyncio.to_thread(_players_online, target)
+        if online == 0:
+            _mark_intentional(target)
+            code, _, err = await asyncio.to_thread(_run, ["docker", "restart", target], 300)
+            restarted = code == 0
+            why = "" if restarted else f"restart failed: {err.strip()[:120]}"
+            if not restarted:
+                _intentional_stops.discard(target)
+        elif online is None:
+            why = "could not read the player count; loads on next restart"
+        else:
+            why = f"{online} player(s) online; loads on next restart"
+    report["restarted"], report["restart_note"] = restarted, why
+    audit("MOD_UPDATE", target, f"{label}: {summary} | "
+                                + ("restarted" if restarted else f"not restarted ({why})"))
+    await notify("", f"⬆️ {label} updated on `{target}`: {summary}. "
+                     + ("Server restarted." if restarted else f"Not restarted — {why}."))
+    return report
 
 # ---------------------------------------------------------------------------
 # Backup retention
@@ -3376,7 +3452,7 @@ async def create_job(request: Request):
     action = data.get("action", "")
     target = data.get("target", "")
     validate_name(target)
-    if action not in ("backup", "start", "stop", "restart"):
+    if action not in ("backup", "start", "stop", "restart", *SCHEDULED_MOD_UPDATES):
         raise HTTPException(400, "Invalid action.")
     job_id = str(uuid.uuid4())[:8]
     try:

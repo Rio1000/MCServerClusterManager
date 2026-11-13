@@ -8,6 +8,7 @@ Minecraft server version / mod update with a blocking compatibility gate.
     ./mc-update.py --scan   --server CSUSERVER --json        # what packwiz does not track
     ./mc-update.py --adopt  --server CSUSERVER               # track it
     ./mc-update.py --update-mods --server CSUSERVER          # newest builds, same MC version
+    ./mc-update.py --update-mods --only geyser,floodgate     # just these pack entries
     ./mc-update.py --regen  -- --dim the_nether --dry-run    # -> mc-chunkdiff.py
 
 Flow for --update:
@@ -1013,12 +1014,14 @@ def ensure_index(pack_dir: str) -> None:
         warn(f"{rel} was missing — recreated; packwiz refresh will rebuild it")
 
 
-def packwiz_update(pack_dir: str) -> None:
+def packwiz_update(pack_dir: str, only: list[str] | None = None) -> None:
+    """`packwiz update --all`, or one `packwiz update <entry>` per name in `only`."""
     pw = packwiz_bin()
     if not pw:
         raise RuntimeError("packwiz is not installed (looked in _bin/ and PATH)")
     ensure_index(pack_dir)
-    for args in (["update", "--all", "-y"], ["refresh"]):
+    steps = [["update", name, "-y"] for name in only] if only else [["update", "--all", "-y"]]
+    for args in steps + [["refresh"]]:
         r = run([pw] + args, cwd=pack_dir, timeout=1800)
         if r.returncode != 0:
             raise RuntimeError(f"packwiz {' '.join(args)} failed: {(r.stderr or r.stdout)[-800:]}")
@@ -1440,8 +1443,9 @@ def _shq(s: str) -> str:
     return s if re.match(r"^[A-Za-z0-9_./:=@%+,-]+$", s) else "'" + s.replace("'", "'\\''") + "'"
 
 
-def update_mods(server: str, pack_dir: str, do_adopt: bool = True) -> dict:
-    """Newest build of every mod for the CURRENT Minecraft version.
+def update_mods(server: str, pack_dir: str, do_adopt: bool = True,
+                only: list[str] | None = None) -> dict:
+    """Newest build of every mod (or just `only`) for the CURRENT Minecraft version.
 
     Does not restart the server: the new jars sit in mods/ and load on the
     next start, which is the admin's call to make.
@@ -1453,7 +1457,13 @@ def update_mods(server: str, pack_dir: str, do_adopt: bool = True) -> dict:
     ok(f"snapshot of pack metadata: {snap['tar']}")
     record = {"new": [], "moved": []}
     adopted, retired = [], []
+    missing: list[str] = []
     try:
+        if only:
+            # A named mod the pack does not list may simply be an untracked jar;
+            # adoption is only worth running if that could be the case.
+            have = {m["slug"] for m in read_pack(pack_dir)}
+            do_adopt = do_adopt and any(n not in have for n in only)
         if do_adopt:
             step("Jars packwiz does not track")
             loose = loose_jars(server, pack_dir)
@@ -1469,8 +1479,18 @@ def update_mods(server: str, pack_dir: str, do_adopt: bool = True) -> dict:
                 if j["status"] not in ("adoptable", "superseded"):
                     warn(f"{j['jar']}: {j['detail']}")
         before = read_pack(pack_dir)
+        if only:
+            have = {m["slug"]: m for m in before}
+            missing = [n for n in only if n not in have]
+            for n in missing:
+                warn(f"'{n}' is not in this server's pack — skipped")
+            only = [n for n in only if n in have and not have[n]["pinned"]]
+            if not only:
+                ok("nothing to update")
+                return {"ok": True, "mod_changes": [], "adopted": adopted, "retired": retired,
+                        "snapshot": snap["tar"], "restart_needed": False, "missing": missing}
         step("packwiz")
-        packwiz_update(pack_dir)
+        packwiz_update(pack_dir, only)
         if resolves:
             step("Mod jars")
             changes = swap_jars(server, pack_dir, before, record)
@@ -1501,7 +1521,8 @@ def update_mods(server: str, pack_dir: str, do_adopt: bool = True) -> dict:
         warn("this server installs mods from the pack on start (PACKWIZ_URL) — "
              "restart it to pull the new builds.")
     return {"ok": True, "mod_changes": changes, "adopted": adopted, "retired": retired,
-            "snapshot": snap["tar"], "restart_needed": bool(changes) and bool(running)}
+            "snapshot": snap["tar"], "restart_needed": bool(changes) and bool(running),
+            "missing": missing}
 
 
 # ===========================================================================
@@ -1555,6 +1576,9 @@ def main() -> None:
                     help="write pack metadata for untracked jars Modrinth recognises")
     ap.add_argument("--update-mods", action="store_true",
                     help="newest build of every mod for the current MC version")
+    ap.add_argument("--only", default="",
+                    help="with --update-mods: comma-separated pack entries to update "
+                         "(the .pw.toml name, e.g. geyser,floodgate) instead of all")
     ap.add_argument("--no-adopt", action="store_true",
                     help="do not adopt untracked jars as part of an update")
     ap.add_argument("--regen", action="store_true",
@@ -1626,7 +1650,10 @@ def _main(a, pack_dir: str | None, how: str, loader: str) -> None:
             if JSON_MODE:
                 emit({**base, "ok": True, **rep, "untracked": left}, 0)
             return
-        result = update_mods(a.server, pack_dir, do_adopt=not a.no_adopt)
+        only = [n.strip() for n in a.only.split(",") if n.strip()]
+        if any(not re.match(r"^[A-Za-z0-9][A-Za-z0-9_.\-]{0,63}$", n) for n in only):
+            die("invalid name in --only")
+        result = update_mods(a.server, pack_dir, do_adopt=not a.no_adopt, only=only or None)
         lock.close()
         if JSON_MODE:
             emit({**base, **result}, 0 if result["ok"] else 1)
