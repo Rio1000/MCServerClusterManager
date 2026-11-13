@@ -932,10 +932,11 @@ def snapshot_pack(server: str, pack_dir: str | None, extra: dict | None = None) 
     mine = sorted(f for f in os.listdir(SNAPSHOT_DIR)
                   if f.startswith(f"{server}-") and f.endswith(".tar.gz"))
     for old in mine[:-SNAPSHOT_KEEP]:
-        try:
-            os.remove(os.path.join(SNAPSHOT_DIR, old))
-        except OSError:
-            pass
+        for path in (old, old[:-len(".tar.gz")] + "-failed-boot.log"):
+            try:
+                os.remove(os.path.join(SNAPSHOT_DIR, path))
+            except OSError:
+                pass
     return snap
 
 
@@ -1272,8 +1273,8 @@ def apply_update(server: str, pack_dir: str | None, target: str, archive: str,
     state = {"compose": False, "restarted": False, "jars": {"new": [], "moved": []},
              "adopted": []}
 
-    def container_logs() -> str:
-        r = run(["docker", "logs", "--tail", "600", server], timeout=60)
+    def container_logs(tail: int = 600) -> str:
+        r = run(["docker", "logs", "--tail", str(tail), server], timeout=60)
         return r.stdout + r.stderr
 
     def undo(why: str) -> dict:
@@ -1282,7 +1283,18 @@ def apply_update(server: str, pack_dir: str | None, target: str, archive: str,
         notes = []
         try:
             if state["restarted"]:
-                world_touched = bool(WORLD_TOUCHED_PAT.search(container_logs()))
+                text = container_logs(4000)
+                world_touched = bool(WORLD_TOUCHED_PAT.search(text))
+                # The failed container is about to be removed and its log with
+                # it. Keep the log: the rollback message only quotes the first
+                # few errors, and the rest say what else has to be fixed.
+                try:
+                    boot_log = snap["tar"][:-len(".tar.gz")] + "-failed-boot.log"
+                    with open(boot_log, "w", encoding="utf-8") as f:
+                        f.write(text)
+                    warn(f"log of the failed boot kept at {boot_log}")
+                except OSError:
+                    pass
                 run(["docker", "stop", "-t", "90", server], timeout=180)
         except Exception as e:
             notes.append(f"stopping the container failed: {e}")
