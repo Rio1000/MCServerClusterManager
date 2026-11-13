@@ -9,6 +9,7 @@ Minecraft server version / mod update with a blocking compatibility gate.
     ./mc-update.py --adopt  --server CSUSERVER               # track it
     ./mc-update.py --update-mods --server CSUSERVER          # newest builds, same MC version
     ./mc-update.py --update-mods --only geyser,floodgate     # just these pack entries
+    ./mc-update.py --update-datapacks --server CSUSERVER     # Vanilla Tweaks, same MC version
     ./mc-update.py --regen  -- --dim the_nether --dry-run    # -> mc-chunkdiff.py
 
 Flow for --update:
@@ -37,6 +38,7 @@ import argparse
 import datetime
 import fcntl
 import hashlib
+import io
 import json
 import os
 import re
@@ -1118,6 +1120,354 @@ def metadata_changes(before: list[dict], pack_dir: str) -> list[dict]:
 
 
 # ===========================================================================
+# Datapacks
+#
+# Mods are not the only thing a new Minecraft version breaks. From 26.3 a
+# datapack whose advancements or loot tables do not parse — or that refers to
+# a loot table which does not exist — stops the server from starting at all,
+# where older versions logged an error and carried on. The 26.2 -> 26.3 update
+# of CSUSERVER failed three times on exactly that, on packs built for 26.1.
+#
+# Vanilla Tweaks publishes a per-version catalogue and builds downloads on
+# request, so its packs can be moved to the matching build as part of the
+# update. This is the endpoint the site's own picker uses, not a published
+# API: any surprise is treated as "leave the datapacks alone".
+# ===========================================================================
+VT_SITE = "https://vanillatweaks.net"
+VT_UA = "Mozilla/5.0 (compatible; mc-update datapack updater)"
+VT_FILE_RE = re.compile(r"^(?P<name>[^/\\]+) v(?P<ver>\d+(?:\.\d+)*) \(MC (?P<mc>[^)/\\]+)\)\.zip$")
+VT_BUNDLE_RE = re.compile(r"^VanillaTweaks_[A-Za-z0-9]+_MC[0-9.]+\.zip$")
+VT_MAX = 64 * 1024 * 1024
+DP_REPLACED = "_datapacks_replaced"
+# <server>/_datapacks_staged/<mc version>/*.zip — datapacks to drop in when the
+# server moves to that version (a hand-fixed pack nothing else can update).
+DP_STAGED = "_datapacks_staged"
+
+
+class VtError(Exception):
+    pass
+
+
+def vt_request(path: str, form: dict | None = None) -> bytes | None:
+    """GET, or POST when `form` is given. None for a 404."""
+    url = VT_SITE + path
+    data = urllib.parse.urlencode(form).encode() if form is not None else None
+    last = ""
+    for attempt in range(3):
+        req = urllib.request.Request(url, data=data, headers={"User-Agent": VT_UA})
+        try:
+            with urllib.request.urlopen(req, timeout=60) as r:
+                body = r.read(VT_MAX + 1)
+            if len(body) > VT_MAX:
+                raise VtError(f"{path}: response exceeds the size limit")
+            return body
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                return None
+            last = f"HTTP {e.code}"
+        except VtError:
+            raise
+        except Exception as e:
+            last = str(e)[:120]
+        time.sleep(2 * (attempt + 1))
+    raise VtError(f"Vanilla Tweaks unreachable for {path} ({last})")
+
+
+def vt_catalogue(kind: str, mc: str) -> dict | None:
+    """{"version": <catalogue version>, "packs": {name: version}} for datapacks
+    ("dp") or crafting tweaks ("ct"), or None if the site has nothing for `mc`."""
+    tried = []
+    for v in (mc, ".".join(mc.split(".")[:2])):
+        if v in tried or not re.match(r"^[0-9][0-9A-Za-z.\-]{0,15}$", v):
+            continue
+        tried.append(v)
+        key = f"vt:{kind}:{v}"
+        if key not in _cache:
+            body = vt_request(f"/assets/resources/json/{v}/{kind}categories.json")
+            try:
+                doc = json.loads(body) if body else None
+                _cache[key] = None if doc is None else {
+                    "version": v,
+                    "packs": {p["name"]: str(p.get("version", ""))
+                              for c in doc["categories"] for p in c["packs"]}}
+            except (ValueError, KeyError, TypeError) as e:
+                raise VtError(f"unexpected catalogue format for {v}: {e}")
+        if _cache[key]:
+            return _cache[key]
+    return None
+
+
+def datapack_dir(server: str) -> str:
+    sdir = os.path.join(DATA_DIR, server)
+    level = "world"
+    try:
+        with open(os.path.join(sdir, "server.properties"), encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if line.startswith("level-name="):
+                    level = line.split("=", 1)[1].strip() or "world"
+    except OSError:
+        pass
+    if "/" in level or level.startswith("."):
+        level = "world"
+    return os.path.join(sdir, level, "datapacks")
+
+
+def crafting_selection(path: str) -> tuple[str, list[str]] | None:
+    """(mc version, tweak names) if this zip is a Vanilla Tweaks crafting bundle."""
+    try:
+        with zipfile.ZipFile(path) as z:
+            if "Selected Packs.txt" not in z.namelist():
+                return None
+            text = z.read("Selected Packs.txt").decode("utf-8", "replace")
+    except (OSError, zipfile.BadZipFile):
+        return None
+    if "Crafting Tweaks" not in text:
+        return None
+    m = re.search(r"^Version:\s*(\S+)", text, re.M)
+    names = [ln.strip() for ln in text.split("Packs:", 1)[-1].splitlines() if ln.strip()]
+    return ((m.group(1) if m else ""), names) if names else None
+
+
+def _vnum(s: str) -> tuple:
+    return tuple(int(x) for x in re.findall(r"\d+", s or ""))
+
+
+def datapack_plan(server: str, mc: str) -> list[dict]:
+    """Every datapack in the world, and what moving to `mc` would do with it.
+
+    status: update | current | staged | unavailable (a Vanilla Tweaks pack with
+    no build for `mc`) | unverified (not from Vanilla Tweaks — nothing can say
+    whether it loads on `mc` short of booting it).
+    """
+    dp = datapack_dir(server)
+    if not os.path.isdir(dp):
+        return []
+    staged_dir = os.path.join(DATA_DIR, server, DP_STAGED, mc)
+    staged = sorted(f for f in os.listdir(staged_dir) if f.endswith(".zip")) \
+        if os.path.isdir(staged_dir) else []
+    cat = {"dp": None, "ct": None}
+    loaded = set()
+
+    def catalogue(kind):
+        if kind not in loaded:
+            cat[kind] = vt_catalogue(kind, mc)
+            loaded.add(kind)
+        return cat[kind]
+
+    rows = []
+    for f in sorted(os.listdir(dp)):
+        full = os.path.join(dp, f)
+        if f in staged:
+            # Already swapped in on an earlier run: nothing left to do.
+            same = file_hash(full, "sha256") == file_hash(os.path.join(staged_dir, f), "sha256")
+            rows.append({"file": f, "kind": "staged",
+                         "status": "current" if same else "staged",
+                         "detail": (f"is the copy staged for {mc}" if same
+                                    else f"replaced by the copy staged for {mc}")})
+            continue
+        m = VT_FILE_RE.match(f) if f.endswith(".zip") else None
+        if m:
+            c = catalogue("dp")
+            row = {"file": f, "kind": "vanillatweaks", "name": m.group("name"),
+                   "installed": m.group("ver"), "installed_mc": m.group("mc")}
+            if not c:
+                row.update(status="unavailable",
+                           detail=f"Vanilla Tweaks has no datapacks for {mc} yet")
+            elif m.group("name") not in c["packs"]:
+                row.update(status="unavailable",
+                           detail=f"not in the Vanilla Tweaks {c['version']} catalogue")
+            else:
+                avail = c["packs"][m.group("name")]
+                row["available"], row["available_mc"] = avail, c["version"]
+                same_mc = m.group("mc") == c["version"]
+                if (same_mc and _vnum(avail) <= _vnum(m.group("ver"))) or \
+                        (not same_mc and _vnum(c["version"]) < _vnum(m.group("mc"))):
+                    row.update(status="current", detail=f"v{m.group('ver')} for MC {m.group('mc')}")
+                else:
+                    row.update(status="update",
+                               detail=f"v{m.group('ver')} (MC {m.group('mc')}) -> "
+                                      f"v{avail} (MC {c['version']})")
+            rows.append(row)
+            continue
+        sel = crafting_selection(full) if f.endswith(".zip") else None
+        if sel:
+            c = catalogue("ct")
+            row = {"file": f, "kind": "craftingtweaks", "installed_mc": sel[0], "tweaks": sel[1]}
+            if not c:
+                row.update(status="unavailable",
+                           detail=f"Vanilla Tweaks has no crafting tweaks for {mc} yet")
+            else:
+                keep = [n for n in sel[1] if n in c["packs"]]
+                gone = [n for n in sel[1] if n not in c["packs"]]
+                row["available_mc"], row["tweaks_available"] = c["version"], keep
+                if not keep:
+                    row.update(status="unavailable",
+                               detail=f"none of its tweaks exist for {c['version']}")
+                elif sel[0] == c["version"] or _vnum(c["version"]) < _vnum(sel[0]):
+                    row.update(status="current", detail=f"built for MC {sel[0]}")
+                else:
+                    row.update(status="update",
+                               detail=f"{len(keep)} crafting tweak(s), MC {sel[0]} -> {c['version']}"
+                                      + (f"; no longer offered: {', '.join(gone)}" if gone else ""))
+            rows.append(row)
+            continue
+        rows.append({"file": f, "kind": "other", "status": "unverified",
+                     "detail": "not from Vanilla Tweaks — cannot be checked or updated"})
+    for f in staged:
+        if not os.path.exists(os.path.join(dp, f)):
+            rows.append({"file": f, "kind": "staged", "status": "staged",
+                         "detail": f"added from the copy staged for {mc}"})
+    return rows
+
+
+def report_datapacks(server: str, mc: str) -> list[dict]:
+    """Print the plan. Never blocks: a datapack cannot be proven compatible
+    without booting it, and the boot watch plus rollback is what catches one
+    that is not."""
+    try:
+        rows = datapack_plan(server, mc)
+    except VtError as e:
+        warn(f"datapacks not checked: {e}")
+        return []
+    if not rows:
+        return rows
+    step("Datapacks")
+    for r in rows:
+        line = f"{r['file']:<52} {r['detail']}"
+        if r["status"] in ("update", "staged"):
+            ok(line + ("" if r["status"] == "staged" else " — will be updated"))
+        elif r["status"] == "current":
+            ok(line)
+        else:
+            warn(line)
+    if any(r["status"] in ("unverified", "unavailable") for r in rows):
+        warn("a datapack that does not load on the new version stops the server "
+             "starting; the update then rolls back and names it.")
+    return rows
+
+
+def _valid_pack_zip(data: bytes) -> bool:
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as z:
+            return z.testzip() is None and "pack.mcmeta" in z.namelist()
+    except zipfile.BadZipFile:
+        return False
+
+
+def _vt_download(endpoint: str, names: list[str], version: str) -> tuple[str, bytes]:
+    body = vt_request(f"/assets/server/{endpoint}",
+                      {"packs": json.dumps({"packs": names}), "version": version})
+    try:
+        link = json.loads(body or b"{}").get("link") or ""
+    except ValueError:
+        link = ""
+    if not re.match(r"^/download/[A-Za-z0-9_.\-]+\.zip$", link):
+        raise VtError(f"{endpoint}: no download link in the response")
+    blob = vt_request(link)
+    if not blob:
+        raise VtError(f"{endpoint}: the download link returned nothing")
+    return os.path.basename(link), blob
+
+
+def swap_datapacks(server: str, mc: str, record: dict) -> list[dict]:
+    """Move the world's datapacks to their builds for `mc`.
+
+    Everything is downloaded and validated before a single file is moved, and
+    what is replaced goes to _datapacks_replaced/ rather than being deleted.
+    `record` is filled in as it goes, in the shape undo_jars() understands.
+    """
+    plan = datapack_plan(server, mc)
+    dp = datapack_dir(server)
+    sdir = os.path.join(DATA_DIR, server)
+    incoming: list[tuple[str | None, str, bytes, str]] = []   # (old file, new file, data, label)
+
+    wanted = {r["name"]: r for r in plan if r["kind"] == "vanillatweaks" and r["status"] == "update"}
+    if wanted:
+        version = next(iter(wanted.values()))["available_mc"]
+        _, blob = _vt_download("zipdatapacks.php", sorted(wanted), version)
+        try:
+            bundle = zipfile.ZipFile(io.BytesIO(blob))
+        except zipfile.BadZipFile:
+            raise VtError("the datapack bundle is not a zip")
+        for inner in bundle.namelist():
+            m = VT_FILE_RE.match(inner)
+            if not m or m.group("name") not in wanted:
+                continue
+            data = bundle.read(inner)
+            if len(data) > VT_MAX or not _valid_pack_zip(data):
+                raise VtError(f"{inner}: not a valid datapack")
+            row = wanted.pop(m.group("name"))
+            incoming.append((row["file"], inner, data, m.group("name")))
+        for name in wanted:
+            warn(f"Vanilla Tweaks did not return '{name}' — left as it is")
+
+    for r in plan:
+        if r["kind"] == "craftingtweaks" and r["status"] == "update":
+            fname, blob = _vt_download("zipcraftingtweaks.php",
+                                       r["tweaks_available"], r["available_mc"])
+            if not _valid_pack_zip(blob):
+                raise VtError("the crafting tweaks bundle is not a valid datapack")
+            if not VT_BUNDLE_RE.match(fname):
+                fname = f"VanillaTweaks_crafting_MC{r['available_mc']}.zip"
+            incoming.append((r["file"], fname, blob, "crafting tweaks"))
+
+    staged_dir = os.path.join(sdir, DP_STAGED, mc)
+    for r in plan:
+        if r["kind"] == "staged":
+            with open(os.path.join(staged_dir, r["file"]), "rb") as f:
+                data = f.read()
+            if not _valid_pack_zip(data):
+                raise VtError(f"staged {r['file']} is not a valid datapack")
+            old = r["file"] if os.path.exists(os.path.join(dp, r["file"])) else None
+            incoming.append((old, r["file"], data, "staged copy"))
+
+    if not incoming:
+        return []
+    retire = os.path.join(sdir, DP_REPLACED, stamp())
+    os.makedirs(retire, exist_ok=True)
+    changes = []
+    for old, new, data, label in incoming:
+        if old:
+            src, dst = os.path.join(dp, old), os.path.join(retire, old)
+            shutil.move(src, dst)
+            record["moved"].append((src, dst))
+        dest = os.path.join(dp, new)
+        tmp = dest + ".part"
+        with open(tmp, "wb") as f:
+            f.write(data)
+        os.replace(tmp, dest)
+        record["new"].append(dest)
+        changes.append({"name": label, "from": old or "(new)", "to": new})
+    return changes
+
+
+def update_datapacks(server: str) -> dict:
+    """Newest Vanilla Tweaks builds for the CURRENT Minecraft version."""
+    mc = current_version(server)
+    if not mc:
+        return {"ok": False, "error": "cannot tell which Minecraft version this server runs"}
+    record = {"new": [], "moved": []}
+    try:
+        rows = report_datapacks(server, mc)
+        changes = swap_datapacks(server, mc, record)
+    except (Exception, KeyboardInterrupt) as e:
+        undo_jars(record)
+        bad(f"datapacks left as they were: {type(e).__name__}: {e}")
+        return {"ok": False, "error": f"{type(e).__name__}: {e}", "rolled_back": True}
+    for c in changes:
+        ok(f"{c['name']}: {c['from']} -> {c['to']}")
+    if not changes:
+        ok("every Vanilla Tweaks datapack is already on its newest build for this version")
+    running = ((inspect(server, fresh=True) or {}).get("State") or {}).get("Running")
+    if changes:
+        warn(f"old datapacks kept in {server}/{DP_REPLACED}/ — "
+             + ("run /reload (or restart) to load the new ones." if running
+                else "they load on the next start."))
+    return {"ok": True, "minecraft": mc, "datapack_changes": changes, "datapacks": rows,
+            "reload_needed": bool(changes) and bool(running)}
+
+
+# ===========================================================================
 # Recreating a container that was started with `docker run`
 # ===========================================================================
 def run_args(info: dict, env_overrides: dict) -> list[str]:
@@ -1271,7 +1621,7 @@ def apply_update(server: str, pack_dir: str | None, target: str, archive: str,
     ok(f"snapshot of pack metadata + container definition: {snap['tar']}")
 
     state = {"compose": False, "restarted": False, "jars": {"new": [], "moved": []},
-             "adopted": []}
+             "datapacks": {"new": [], "moved": []}, "adopted": []}
 
     def container_logs(tail: int = 600) -> str:
         r = run(["docker", "logs", "--tail", str(tail), server], timeout=60)
@@ -1301,6 +1651,7 @@ def apply_update(server: str, pack_dir: str | None, target: str, archive: str,
         for label, fn in (
             ("compose file", lambda: state["compose"] and _write_atomic(COMPOSE, compose_text)),
             ("mod jars", lambda: undo_jars(state["jars"])),
+            ("datapacks", lambda: undo_jars(state["datapacks"])),
             ("pack metadata", lambda: restore_pack(snap)),
         ):
             try:
@@ -1359,7 +1710,7 @@ def apply_update(server: str, pack_dir: str | None, target: str, archive: str,
             state["compose"] = True
             ok(f"compose VERSION {prev} -> {target}")
 
-        changes = []
+        changes, dp_changes = [], []
         if pack_dir:
             if do_adopt and loose:
                 rep = adopt(server, pack_dir, loose)
@@ -1382,6 +1733,21 @@ def apply_update(server: str, pack_dir: str | None, target: str, archive: str,
             else:
                 changes = metadata_changes(before, pack_dir)
             for c in changes:
+                ok(f"{c['name']}: {c['from']} -> {c['to']}")
+
+        # Datapacks move with the version: the builds for the new version go in
+        # now and come back out if the boot fails. A problem fetching them is
+        # not a reason to abandon the update — the boot watch decides.
+        dp_changes = []
+        try:
+            dp_changes = swap_datapacks(server, target, state["datapacks"])
+        except VtError as e:
+            undo_jars(state["datapacks"])
+            state["datapacks"] = {"new": [], "moved": []}
+            warn(f"datapacks not updated: {e}")
+        if dp_changes:
+            step("Datapacks")
+            for c in dp_changes:
                 ok(f"{c['name']}: {c['from']} -> {c['to']}")
 
         step("Restart")
@@ -1431,7 +1797,8 @@ def apply_update(server: str, pack_dir: str | None, target: str, archive: str,
         return undo(f"{type(e).__name__}: {e}")
 
     base = {"target": target, "archive": archive, "snapshot": snap["tar"],
-            "mod_changes": changes, "adopted": state["adopted"]}
+            "mod_changes": changes, "datapack_changes": dp_changes,
+            "adopted": state["adopted"]}
     if started:
         ok(f"server booted on {target}")
         return {**base, "ok": True, "booted": True}
@@ -1588,6 +1955,8 @@ def main() -> None:
                     help="write pack metadata for untracked jars Modrinth recognises")
     ap.add_argument("--update-mods", action="store_true",
                     help="newest build of every mod for the current MC version")
+    ap.add_argument("--update-datapacks", action="store_true",
+                    help="newest Vanilla Tweaks datapacks for the current MC version")
     ap.add_argument("--only", default="",
                     help="with --update-mods: comma-separated pack entries to update "
                          "(the .pw.toml name, e.g. geyser,floodgate) instead of all")
@@ -1631,6 +2000,17 @@ def main() -> None:
 
 def _main(a, pack_dir: str | None, how: str, loader: str) -> None:
     pack_note = f"{pack_dir} ({how})" if pack_dir else "none"
+
+    if a.update_datapacks:
+        step(f"{a.server}: datapacks in {datapack_dir(a.server)}")
+        lock = hold_lock(a.server)
+        result = update_datapacks(a.server)
+        lock.close()
+        if JSON_MODE:
+            emit({"server": a.server, **result}, 0 if result["ok"] else 1)
+        if not result["ok"]:
+            sys.exit(1)
+        return
 
     # ---- scan / adopt / update-mods: no target version involved ---------
     if a.scan or a.adopt or a.update_mods:
@@ -1698,8 +2078,11 @@ def _main(a, pack_dir: str | None, how: str, loader: str) -> None:
     passed, blockers, report, loose = check_compat(
         pack_dir, a.target, loader, a.server, a.allow_loose_jars)
 
+    datapacks = report_datapacks(a.server, a.target)
+
     base = {"server": a.server, "current": current, "target": a.target,
             "loader": loader, "up_to_date": False, "pack": pack_dir,
+            "datapacks": datapacks,
             "compose_service": compose_service_of(a.server),
             "mods": report, "blockers": blockers, "loose_jars": loose}
 

@@ -1509,6 +1509,8 @@ async def _execute_job(action: str, target: str) -> None:
         await asyncio.to_thread(_run, ["docker", action, target])
     elif action in SCHEDULED_MOD_UPDATES:
         await _scheduled_mod_update(action, target)
+    elif action == "update-datapacks":
+        await _scheduled_datapack_update(target)
 
 
 # Scheduled single-mod updates. Geyser has to track the Bedrock client: when
@@ -1518,6 +1520,45 @@ async def _execute_job(action: str, target: str) -> None:
 SCHEDULED_MOD_UPDATES = {
     "update-geyser": ("Geyser", ["geyser", "floodgate"]),
 }
+SCHEDULED_ACTIONS = ("backup", "start", "stop", "restart", "update-datapacks",
+                     *SCHEDULED_MOD_UPDATES)
+
+
+async def _scheduled_datapack_update(target: str) -> dict:
+    """Move Vanilla Tweaks datapacks to their newest build for this version.
+
+    Datapacks load with /reload, so unlike a mod update this needs no restart
+    and nobody is disconnected.
+    """
+    running_update = _update_runs.get(target)
+    if running_update and running_update.get("state") == "running":
+        audit("DATAPACK_UPDATE_SKIP", target, "another update is running")
+        return {"ok": False, "error": "another update is running"}
+    try:
+        report = await asyncio.to_thread(
+            _updater_json, ["--server", target, "--update-datapacks"], 900)
+    except HTTPException as exc:
+        report = {"ok": False, "error": str(exc.detail)}
+    if not report.get("ok"):
+        err = str(report.get("error") or "unknown error")[:300]
+        audit("DATAPACK_UPDATE_FAIL", target, err)
+        await notify("", f"⚠️ Scheduled datapack update on `{target}` FAILED: {err}")
+        return report
+    changes = report.get("datapack_changes") or []
+    if not changes:
+        audit("DATAPACK_UPDATE", target, "already up to date")
+        return report
+    summary = "; ".join(f"{c['from']} -> {c['to']}" for c in changes)
+    note = "loads on next start"
+    if await asyncio.to_thread(_is_running, target):
+        code, _, err = await asyncio.to_thread(_rcon, target, "reload", 120)
+        note = "reloaded" if code == 0 else f"reload failed ({err.strip()[:80]}); loads on next restart"
+    report["reload_note"] = note
+    audit("DATAPACK_UPDATE", target, f"{summary} | {note}")
+    await notify("", f"⬆️ Datapacks updated on `{target}`: {summary}. {note.capitalize()}.")
+    return report
+
+
 _ONLINE_RE = re.compile(r'There are (\d+) of a max', re.I)
 
 
@@ -3452,7 +3493,7 @@ async def create_job(request: Request):
     action = data.get("action", "")
     target = data.get("target", "")
     validate_name(target)
-    if action not in ("backup", "start", "stop", "restart", *SCHEDULED_MOD_UPDATES):
+    if action not in SCHEDULED_ACTIONS:
         raise HTTPException(400, "Invalid action.")
     job_id = str(uuid.uuid4())[:8]
     try:

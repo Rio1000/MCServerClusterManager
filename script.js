@@ -1268,7 +1268,24 @@ async function runUpdateCheck() {
     <div class="srv-meta" style="margin-bottom:6px;">${verdict}</div>
     ${blockers.length ? `<ul class="upd-blockers">${
       blockers.map(b => `<li>${escapeHtml(b)}</li>`).join('')}</ul>` : ''}
-    ${looseHtml}`;
+    ${looseHtml}${datapackHtml(d.datapacks)}`;
+}
+
+function datapackHtml(rows) {
+  rows = rows || [];
+  if (!rows.length) return '';
+  const moving = rows.filter(r => ['update', 'staged'].includes(r.status));
+  const risky = rows.filter(r => ['unverified', 'unavailable'].includes(r.status));
+  const list = rs => rs.map(r =>
+    `<li><code>${escapeHtml(r.file)}</code> — ${escapeHtml(r.detail || r.status)}</li>`).join('');
+  return `
+    <div class="card-hint" style="margin-top:6px;">${rows.length} datapack(s) in the world:
+      ${moving.length} will be moved to the build for this version, ${risky.length} cannot
+      be checked.</div>
+    ${moving.length ? `<ul class="upd-blockers">${list(moving)}</ul>` : ''}
+    ${risky.length ? `<div class="card-hint" style="color:var(--warn,#c90);">These cannot be
+      verified. If one does not load on the new version the server will not start, and the
+      update rolls back and names it:</div><ul class="upd-blockers">${list(risky)}</ul>` : ''}`;
 }
 
 function updateFlags() {
