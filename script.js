@@ -165,6 +165,7 @@ document.addEventListener('DOMContentLoaded', () => {
   renderRconCommands();
   renderModalTabs();
   initTheme();
+  populateNetworks();
 });
 
 // ---------------------------------------------------------------------------
@@ -512,6 +513,7 @@ async function createServer() {
   const port = document.getElementById('new-port').value.trim() || '25565';
   const memory = document.getElementById('new-memory').value.trim() || '2G';
   const extraPorts = document.getElementById('new-extra-ports').value.trim();
+  const network = document.getElementById('new-network').value;
 
   if (!name) { toast('Container ID is required.', 'error'); return; }
 
@@ -532,7 +534,10 @@ async function createServer() {
 
   const res = await fetch('/api/server/create', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ name, type, version, snapshot, port, memory, extra_ports: extraPorts }),
+    body: JSON.stringify({
+      name, type, version, snapshot, port, memory,
+      extra_ports: extraPorts, network,
+    }),
   }).catch(() => null);
 
   btn.disabled = false;
@@ -909,6 +914,21 @@ function addExtraPort(spec) {
   const parts = el.value.split(/[,\s]+/).filter(Boolean);
   if (!parts.includes(spec)) parts.push(spec);
   el.value = parts.join(', ');
+}
+
+// A container on the default bridge gets no DNS, so a reverse proxy in another
+// container cannot reach it by name. Offer the host's user-defined networks.
+async function populateNetworks() {
+  const sel = document.getElementById('new-network');
+  if (!sel) return;
+  const res = await fetch('/api/networks').catch(() => null);
+  if (!res || !res.ok) return;
+  const d = await res.json().catch(() => ({}));
+  const nets = d.networks || [];
+  sel.innerHTML = '<option value="">Default bridge (no DNS)</option>'
+    + nets.filter(n => n.name !== 'bridge')
+        .map(n => `<option value="${escapeHtml(n.name)}">${escapeHtml(n.name)}`
+                + ` (${escapeHtml(n.driver)})</option>`).join('');
 }
 
 async function refreshPackwizStatus() {

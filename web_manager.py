@@ -145,6 +145,27 @@ def _bound_host_ports() -> set[tuple[int, str]]:
     return bound
 
 
+# Docker's own naming rule for networks.
+_NETWORK_RE = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9_.\-]{0,63}$')
+
+# "host" ignores -p entirely and "none" has no connectivity at all; neither can
+# serve a published Minecraft port, so they are not offered.
+_UNUSABLE_NETWORKS = {"host", "none"}
+
+
+def _docker_networks() -> list[dict]:
+    code, out, _ = _run(
+        ["docker", "network", "ls", "--format", "{{.Name}}|{{.Driver}}"])
+    if code != 0:
+        return []
+    nets = []
+    for line in out.splitlines():
+        parts = line.split("|")
+        if len(parts) >= 2 and parts[0] not in _UNUSABLE_NETWORKS:
+            nets.append({"name": parts[0], "driver": parts[1]})
+    return nets
+
+
 def _docker_env(name: str) -> dict[str, str]:
     code, out, _ = _run(
         ["docker", "inspect", "-f", "{{range .Config.Env}}{{println .}}{{end}}", name])
@@ -322,6 +343,20 @@ async def create_server(request: Request):
     # Extra bindings for things that listen outside the Java port — Geyser's
     # Bedrock port and Simple Voice Chat are both UDP, so the protocol has to
     # travel with the number. Docker can only set these at creation time.
+    # Containers left on the default bridge get no DNS, so nothing else on the
+    # host can reach them by name — a reverse proxy in another container cannot
+    # route to them at all. Naming a user-defined network fixes that at create
+    # time, which is the only time docker will accept it.
+    network = str(data.get("network", "") or "").strip()
+    if network:
+        if not _NETWORK_RE.match(network):
+            raise HTTPException(400, f"Invalid network name '{network}'.")
+        if network in _UNUSABLE_NETWORKS:
+            raise HTTPException(
+                400, f"'{network}' cannot publish ports; pick a bridge network.")
+        if network not in {n["name"] for n in _docker_networks()}:
+            raise HTTPException(400, f"Docker network '{network}' does not exist.")
+
     extra_raw = data.get("extra_ports", [])
     if isinstance(extra_raw, str):
         extra_raw = re.split(r'[,\s]+', extra_raw.strip())
@@ -349,6 +384,8 @@ async def create_server(request: Request):
     os.makedirs(server_path, exist_ok=True)
 
     cmd = ["docker", "run", "-d", "-it", "--name", name]
+    if network:
+        cmd += ["--network", network]
     for b in bindings:
         cmd += ["-p", f"{b['host']}:{b['container']}/{b['proto']}"]
     cmd += [
@@ -365,7 +402,8 @@ async def create_server(request: Request):
 
     bound = " ".join(f"{b['host']}:{b['container']}/{b['proto']}" for b in bindings)
     audit("DEPLOY", name,
-          f"type={server_type} version={version} memory={memory} ports={bound}")
+          f"type={server_type} version={version} memory={memory} ports={bound} "
+          f"network={network or 'default bridge'}")
     extra_note = f" ({len(bindings) - 1} extra port(s) bound)" if len(bindings) > 1 else ""
     return JSONResponse({"message": f"Server '{name}' deployed.{extra_note}"})
 
@@ -498,6 +536,11 @@ async def packwiz_exec(request: Request, name: str = Path(...)):
     subprocess.run([packwiz, "refresh"], cwd=server_path, capture_output=True, check=False)
     audit("PACKWIZ", name, f"action={action} mod={mod_slug}")
     return JSONResponse({"message": f"Packwiz {action} completed for '{mod_slug}'."})
+
+@app.get("/api/networks")
+async def list_networks():
+    return JSONResponse({"networks": _docker_networks()})
+
 
 @app.get("/api/packwiz/status")
 async def packwiz_status():

@@ -143,6 +143,12 @@
                 <label class="field-lbl" for="new-memory">Memory</label>
                 <input type="text" id="new-memory" class="mc-input" placeholder="2G" value="2G">
               </div>
+              <div class="field">
+                <label class="field-lbl" for="new-network">Docker Network</label>
+                <select id="new-network" class="mc-select">
+                  <option value="">Default bridge (no DNS)</option>
+                </select>
+              </div>
               <div class="field wide">
                 <label class="field-lbl" for="new-extra-ports">Extra Ports</label>
                 <input type="text" id="new-extra-ports" class="mc-input"
@@ -156,6 +162,11 @@
               <button type="button" class="mc-btn sm" onclick="addExtraPort('24454/udp')">Voice Chat 24454/udp</button>
               <button type="button" class="mc-btn sm" onclick="addExtraPort('25575')">RCON 25575</button>
             </div>
+            <p class="card-hint" style="margin-top:6px;">
+              Pick a user-defined network if another container &mdash; a reverse proxy, say &mdash;
+              needs to reach this one by name. On the default bridge, container names do not
+              resolve. Like ports, this is fixed when the container is created.
+            </p>
             <p class="card-hint" style="margin-top:6px;">
               One per entry: <code>PORT</code>, <code>PORT/udp</code>, or <code>HOST:CONTAINER/udp</code>.
               Bedrock and Simple Voice Chat are UDP. Docker fixes bindings when the container is
